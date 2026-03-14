@@ -157,8 +157,8 @@ class OpenClawAgent:
         self.poll_llm_marker = os.getenv("WTT_POLL_LLM_MARKER", "[AUTO-REASONED]")
 
         config_path = os.path.expanduser("~/.openclaw/openclaw.json")
-        self.gateway_url = os.getenv("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789")
-        self.gateway_token = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
+        self.gateway_url = "http://127.0.0.1:18789"
+        self.gateway_token = ""
         self._openclaw_send_disabled = False
         self._openclaw_send_disabled_reason = ""
 
@@ -168,7 +168,7 @@ class OpenClawAgent:
                 with open(config_path) as f:
                     config = json.load(f)
             except Exception as e:
-                print(f"⚠️ Failed to read openclaw.json, continue with env vars: {e}")
+                print(f"⚠️ Failed to read openclaw.json: {e}")
                 config = {}
 
         channels_cfg = config.get('channels', {}) if isinstance(config, dict) else {}
@@ -191,11 +191,24 @@ class OpenClawAgent:
         # fallback routes format: channel:target,channel:target
         self.im_fallback_routes = self._parse_fallbacks(os.getenv("WTT_IM_FALLBACKS", ""))
 
-        # Derive tools/invoke endpoint and token from gateway config
+        # Derive tools/invoke endpoint and token only from OpenClaw config.
+        # Do not depend on custom gateway URL/token values in skill .env.
         gw = config.get('gateway', {}) if isinstance(config, dict) else {}
         port = gw.get('port', 18789)
-        self.gateway_url = os.getenv("OPENCLAW_GATEWAY_URL", f"http://127.0.0.1:{port}")
-        self.gateway_token = os.getenv("OPENCLAW_GATEWAY_TOKEN", gw.get('auth', {}).get('token', ""))
+        self.gateway_url = f"http://127.0.0.1:{port}"
+        self.gateway_token = (gw.get('auth', {}) or {}).get('token', "")
+
+        # Reminder: sessions_* tools must be enabled in gateway.tools.allow.
+        allow = set((gw.get('tools', {}) or {}).get('allow', []) or [])
+        required = {"sessions_spawn", "sessions_send", "sessions_history"}
+        missing = sorted(required - allow)
+        if missing:
+            print(
+                "⚠️ Gateway tools.allow missing required session tools: "
+                + ", ".join(missing)
+                + ". Please enable: sessions_spawn, sessions_send, sessions_history"
+                + " (optional: sessions_list)."
+            )
     def get_id(self):
         return self.agent_id
 
@@ -351,7 +364,12 @@ class OpenClawAgent:
             except Exception as e:
                 last_err = e
                 continue
-        raise RuntimeError(f"invoke {tool} failed on all endpoints: {last_err}")
+        hint = (
+            " Hint: check OpenClaw gateway is running and enable session tools in "
+            "gateway.tools.allow (sessions_spawn, sessions_send, sessions_history"
+            ", optionally sessions_list)."
+        )
+        raise RuntimeError(f"invoke {tool} failed on all endpoints: {last_err}.{hint}")
 
     async def _invoke_tool(self, tool: str, args: dict) -> dict:
         return await asyncio.to_thread(self._invoke_tool_sync, tool, args)

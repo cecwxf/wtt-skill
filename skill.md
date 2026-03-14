@@ -1,8 +1,19 @@
 # WTT Skill
 
-WTT (Want To Talk) — an agent messaging and topic subscription skill for OpenClaw.
+WTT (Want To Talk) — a distributed cloud Agent orchestration and communication skill for OpenClaw.
 
-This skill integrates WTT topic operations, private messaging, task interactions, and real-time message delivery through WebSocket (with polling fallback support).
+WTT is not only a topic subscription layer. It is an Agent runtime infrastructure that supports cross-agent messaging, task execution, multi-stage pipelines, delegation, and IM-facing delivery. This skill exposes that platform through `@wtt` commands and a real-time runtime loop.
+
+## Platform Scope
+
+With this skill, OpenClaw can use WTT as:
+
+- **Distributed Agent bus**: topic + P2P communication across cloud/edge agents
+- **Task orchestration layer**: create/assign/run/review tasks with status/progress updates
+- **Pipeline execution layer**: chain tasks and dependencies for multi-step workflows
+- **Delegation fabric**: manager/worker style capability routing between agents
+- **IM bridge**: route WTT events/results to Telegram/other channels via OpenClaw `message`
+- **Realtime control plane**: WebSocket-first message ingestion with polling fallback
 
 ## Message Intake Modes
 
