@@ -5,33 +5,14 @@ SCRIPT_PATH="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' 
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-resolve_skill_root() {
-  local candidates=(
-    "$(cd "$SCRIPT_DIR/.." && pwd)"
-    "$(cd "$SCRIPT_DIR/../.." && pwd)"
-    "$HOME/.openclaw/skills/wtt"
-    "$HOME/.openclaw/skills/wtt-skill"
-  )
-  local c
-  for c in "${candidates[@]}"; do
-    if [[ -f "$c/start_wtt_autopoll.py" ]]; then
-      echo "$c"
-      return 0
-    fi
-  done
-  return 1
-}
-
-SKILL_ROOT="$(resolve_skill_root || true)"
-if [[ -z "$SKILL_ROOT" ]]; then
-  echo "❌ start_wtt_autopoll.py not found. Checked:"
-  echo "   - $(cd "$SCRIPT_DIR/.." && pwd)"
-  echo "   - $(cd "$SCRIPT_DIR/../.." && pwd)"
-  echo "   - $HOME/.openclaw/skills/wtt"
-  echo "   - $HOME/.openclaw/skills/wtt-skill"
+# Fixed install location: ~/.openclaw/workspace/skills/wtt-skill
+SKILL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+START_SCRIPT="$SKILL_ROOT/start_wtt_autopoll.py"
+if [[ ! -f "$START_SCRIPT" ]]; then
+  echo "❌ start_wtt_autopoll.py not found: $START_SCRIPT"
+  echo "Expected install path: ~/.openclaw/workspace/skills/wtt-skill"
   exit 1
 fi
-START_SCRIPT="$SKILL_ROOT/start_wtt_autopoll.py"
 
 WORKDIR="$SKILL_ROOT"
 PY_BIN="${PY_BIN:-}"

@@ -84,11 +84,11 @@ Uses HTTP polling via `wtt_poll`.
 
 Copy this directory to:
 
-`~/.openclaw/skills/wtt`
+`~/.openclaw/workspace/skills/wtt-skill`
 
 ### Runtime config (single source)
 
-Set `~/.openclaw/skills/wtt/.env`:
+Set `~/.openclaw/workspace/skills/wtt-skill/.env`:
 
 ```dotenv
 WTT_AGENT_ID=your_agent_id
@@ -104,19 +104,19 @@ WTT_POLL_INTERVAL=30
 Run:
 
 ```bash
-bash ~/.openclaw/skills/wtt/scripts/install_autopoll.sh
+bash ~/.openclaw/workspace/skills/wtt-skill/scripts/install_autopoll.sh
 ```
 
 Check:
 
 ```bash
-bash ~/.openclaw/skills/wtt/scripts/status_autopoll.sh
+bash ~/.openclaw/workspace/skills/wtt-skill/scripts/status_autopoll.sh
 ```
 
 Uninstall service:
 
 ```bash
-bash ~/.openclaw/skills/wtt/scripts/uninstall_autopoll.sh
+bash ~/.openclaw/workspace/skills/wtt-skill/scripts/uninstall_autopoll.sh
 ```
 
 ## IM-first setup flow (recommended)

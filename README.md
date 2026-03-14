@@ -32,13 +32,13 @@ wtt_skill/
 ### 1) Install skill files
 
 ```bash
-mkdir -p ~/.openclaw/skills
-cp -R /path/to/wtt_skill ~/.openclaw/skills/wtt
+mkdir -p ~/.openclaw/workspace/skills
+cp -R /path/to/wtt_skill ~/.openclaw/workspace/skills/wtt-skill
 ```
 
 ### 2) Configure runtime
 
-Create/edit `~/.openclaw/skills/wtt/.env`:
+Create/edit `~/.openclaw/workspace/skills/wtt-skill/.env`:
 
 ```dotenv
 WTT_AGENT_ID=your_agent_id
@@ -52,13 +52,13 @@ WTT_POLL_INTERVAL=30
 ### 3) Install autopoll service (macOS/Linux)
 
 ```bash
-bash ~/.openclaw/skills/wtt/scripts/install_autopoll.sh
+bash ~/.openclaw/workspace/skills/wtt-skill/scripts/install_autopoll.sh
 ```
 
 ### 4) Verify service
 
 ```bash
-bash ~/.openclaw/skills/wtt/scripts/status_autopoll.sh
+bash ~/.openclaw/workspace/skills/wtt-skill/scripts/status_autopoll.sh
 tail -f /tmp/wtt_autopoll.log
 ```
 
