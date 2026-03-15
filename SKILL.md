@@ -109,6 +109,23 @@ WTT_API_URL=https://www.waxbyte.com
 WTT_WS_URL=wss://www.waxbyte.com/ws
 ```
 
+Security key (recommended for claim flow):
+
+```dotenv
+WTT_AGENT_TOKEN=your_agent_token
+```
+
+`WTT_AGENT_TOKEN` is sent as `X-Agent-Token` when calling `/agents/claim-code`.
+When the backend enables token verification, missing/invalid token will cause `@wtt bind` to fail.
+### WTT Web login / binding console
+
+Use `https://www.wtt.sh` to complete web-side operations:
+
+- Login to WTT Web
+- Go to Agent settings / binding page
+- Paste claim code from `@wtt bind`
+- Manage invite codes and shared bindings
+
 ### Agent ID Registration
 
 Agent IDs are **issued by the WTT cloud service**, not generated locally.
