@@ -38,19 +38,48 @@ START_SCRIPT="$SKILL_ROOT/start_wtt_autopoll.py"
 WORKDIR="$SKILL_ROOT"
 WRAPPER_SCRIPT="$SKILL_ROOT/run_autopoll.sh"
 
-# Resolve runtime python: explicit override > skill-local venv > create skill-local venv > python3
+ensure_skill_venv() {
+  local base_py
+  base_py="$(command -v python3 || true)"
+  if [[ -z "$base_py" ]]; then
+    return 1
+  fi
+
+  if "$base_py" -m venv "$SKILL_ROOT/.venv" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ "$(uname -s)" == "Linux" ]] && [[ "${EUID:-$(id -u)}" == "0" ]] && command -v apt-get >/dev/null 2>&1; then
+    echo "ℹ️  python venv unavailable, installing python3-venv prerequisites..."
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y python3-venv python3.12-venv >/dev/null 2>&1 || true
+    "$base_py" -m venv "$SKILL_ROOT/.venv" >/dev/null 2>&1 || return 1
+    return 0
+  fi
+
+  return 1
+}
+
+# Resolve runtime python: explicit override > skill-local venv (with pip) > create/repair skill-local venv > fallback python3
 PY_BIN="${PY_BIN:-}"
 if [[ -z "$PY_BIN" ]]; then
   if [[ -x "$SKILL_ROOT/.venv/bin/python" ]]; then
-    PY_BIN="$SKILL_ROOT/.venv/bin/python"
-  else
-    BASE_PY="$(command -v python3 || true)"
-    if [[ -n "$BASE_PY" ]]; then
-      if "$BASE_PY" -m venv "$SKILL_ROOT/.venv" >/dev/null 2>&1; then
+    if "$SKILL_ROOT/.venv/bin/python" -m pip --version >/dev/null 2>&1; then
+      PY_BIN="$SKILL_ROOT/.venv/bin/python"
+    else
+      echo "⚠️  Found broken .venv (pip missing), recreating..."
+      rm -rf "$SKILL_ROOT/.venv"
+      if ensure_skill_venv && [[ -x "$SKILL_ROOT/.venv/bin/python" ]]; then
         PY_BIN="$SKILL_ROOT/.venv/bin/python"
-      else
-        PY_BIN="$BASE_PY"
       fi
+    fi
+  fi
+
+  if [[ -z "$PY_BIN" ]]; then
+    if ensure_skill_venv && [[ -x "$SKILL_ROOT/.venv/bin/python" ]]; then
+      PY_BIN="$SKILL_ROOT/.venv/bin/python"
+    else
+      PY_BIN="$(command -v python3 || true)"
     fi
   fi
 fi
@@ -78,8 +107,14 @@ ensure_python_deps() {
   fi
 
   if ! "$PY_BIN" -m pip --version >/dev/null 2>&1; then
-    echo "⚠️  pip is unavailable for $PY_BIN; skip dependency install"
-    return 0
+    local fallback_py="$HOME/.openclaw/workspace/skills/.venv311/bin/python"
+    if [[ -x "$fallback_py" ]] && "$fallback_py" -m pip --version >/dev/null 2>&1; then
+      echo "⚠️  pip unavailable on selected python; fallback to $fallback_py"
+      PY_BIN="$fallback_py"
+    else
+      echo "❌ pip is unavailable for $PY_BIN and no fallback interpreter found"
+      return 1
+    fi
   fi
 
   local missing
@@ -101,11 +136,18 @@ PY
   fi
 
   echo "ℹ️  Installing python deps for wtt-skill: $missing"
-  "$PY_BIN" -m pip install "${pip_args[@]}" \
+  if ! "$PY_BIN" -m pip install "${pip_args[@]}" \
     "httpx>=0.24" \
     "websockets>=11" \
     "python-dotenv>=1" \
-    "socksio>=1"
+    "socksio>=1"; then
+    echo "⚠️  Initial pip install failed, retry with --break-system-packages"
+    "$PY_BIN" -m pip install --break-system-packages "${pip_args[@]}" \
+      "httpx>=0.24" \
+      "websockets>=11" \
+      "python-dotenv>=1" \
+      "socksio>=1"
+  fi
   echo "✅ Python deps installed"
 }
 
