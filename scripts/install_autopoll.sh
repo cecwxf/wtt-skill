@@ -160,9 +160,22 @@ set -euo pipefail
 SKILL_DIR="${WTT_SKILL_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 cd "$SKILL_DIR"
 
+is_py_ready() {
+  local py="$1"
+  [[ -x "$py" ]] || return 1
+  "$py" - <<'PY' >/dev/null 2>&1
+import importlib.util, sys
+req = ("httpx", "websockets", "dotenv", "socksio")
+missing = [m for m in req if importlib.util.find_spec(m) is None]
+sys.exit(0 if not missing else 1)
+PY
+}
+
 choose_py() {
   local c
-  if [[ -n "${WTT_PY_BIN:-}" ]] && [[ -x "${WTT_PY_BIN}" ]]; then
+
+  # Even when WTT_PY_BIN is set by systemd, verify deps before using it.
+  if [[ -n "${WTT_PY_BIN:-}" ]] && is_py_ready "${WTT_PY_BIN}"; then
     echo "${WTT_PY_BIN}"
     return 0
   fi
@@ -171,21 +184,32 @@ choose_py() {
     "$SKILL_DIR/.venv/bin/python"
     "$SKILL_DIR/.venv311/bin/python"
     "$HOME/.openclaw/workspace/skills/.venv311/bin/python"
+    "$(command -v python3 || true)"
   )
 
   for c in "${candidates[@]}"; do
-    if [[ -x "$c" ]]; then
+    if [[ -n "$c" ]] && is_py_ready "$c"; then
       echo "$c"
       return 0
     fi
   done
 
+  # Last resort: keep previous behavior (will fail fast with clear error)
+  if [[ -n "${WTT_PY_BIN:-}" ]] && [[ -x "${WTT_PY_BIN}" ]]; then
+    echo "${WTT_PY_BIN}"
+    return 0
+  fi
   command -v python3
 }
 
 PY="$(choose_py)"
 if [[ -z "$PY" || ! -x "$PY" ]]; then
   echo "❌ No runnable python found for wtt autopoll"
+  exit 1
+fi
+
+if ! is_py_ready "$PY"; then
+  echo "❌ Python missing required deps (httpx/websockets/python-dotenv/socksio): $PY"
   exit 1
 fi
 
@@ -266,6 +290,72 @@ EOF
 
   echo "✅ Checked required .env keys: $ENV_FILE"
   echo "ℹ️  Effective env: agent_id=${final_agent_id:-'(empty, will auto-register at runtime)'} channel=${final_channel:-'(empty)'} target=${final_target:-'(empty)'}"
+}
+
+ensure_gateway_session_tools() {
+  local mode="${WTT_GATEWAY_PATCH_MODE:-auto}"  # auto|check|off
+  if [[ "$mode" == "off" ]]; then
+    return 0
+  fi
+
+  if [[ -z "$OPENCLAW_BIN" ]] || ! command -v "$OPENCLAW_BIN" >/dev/null 2>&1; then
+    echo "⚠️  openclaw binary not found; skip gateway.tools.allow check"
+    return 0
+  fi
+
+  local cfg="${OPENCLAW_CONFIG_PATH:-$HOME/.openclaw/openclaw.json}"
+  if [[ ! -f "$cfg" ]]; then
+    echo "⚠️  openclaw config not found at $cfg; skip gateway permission check"
+    return 0
+  fi
+
+  local pyout
+  pyout="$(python3 - "$cfg" <<'PY'
+import json, sys
+p = sys.argv[1]
+required = ["sessions_spawn", "sessions_send", "sessions_history", "sessions_list"]
+with open(p, 'r', encoding='utf-8') as f:
+    data = json.load(f)
+
+gw = data.setdefault('gateway', {})
+tools = gw.setdefault('tools', {})
+allow = tools.get('allow')
+if not isinstance(allow, list):
+    allow = [] if allow is None else [str(allow)]
+
+missing = [x for x in required if x not in allow]
+changed = False
+if missing:
+    allow.extend(missing)
+    tools['allow'] = allow
+    changed = True
+
+if changed:
+    with open(p, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write('\n')
+
+print('CHANGED=' + ('1' if changed else '0'))
+print('MISSING=' + ','.join(missing))
+PY
+)"
+
+  local changed missing
+  changed="$(echo "$pyout" | sed -n 's/^CHANGED=//p' | tail -n1)"
+  missing="$(echo "$pyout" | sed -n 's/^MISSING=//p' | tail -n1)"
+
+  if [[ "$changed" == "1" ]]; then
+    echo "✅ Patched gateway.tools.allow in $cfg"
+    echo "   Added: ${missing}"
+    if [[ "$mode" == "auto" ]]; then
+      echo "ℹ️  Restarting gateway to apply permission changes..."
+      "$OPENCLAW_BIN" gateway restart || true
+    else
+      echo "ℹ️  Run: openclaw gateway restart"
+    fi
+  else
+    echo "✅ gateway.tools.allow already includes required session tools"
+  fi
 }
 
 echo "ℹ️  REPO_ROOT:       $REPO_ROOT"
@@ -360,6 +450,7 @@ UNIT
 init_env_file
 ensure_wrapper_script
 ensure_python_deps
+ensure_gateway_session_tools
 
 case "$(uname -s)" in
   Darwin)

@@ -151,7 +151,16 @@ Then set `WTT_AGENT_ID=agent-a1b2c3d4e5f6` in your `.env`.
 
 ### OpenClaw gateway permissions (required)
 
-If `wtt-skill` uses session tools (`sessions_spawn`, `sessions_send`, `sessions_history`, optional `sessions_list`), make sure they are allowed in `~/.openclaw/openclaw.json`:
+If `wtt-skill` uses session tools (`sessions_spawn`, `sessions_send`, `sessions_history`, optional `sessions_list`), they must be allowed in `~/.openclaw/openclaw.json`.
+
+`install_autopoll.sh` now checks and patches this automatically by default (`WTT_GATEWAY_PATCH_MODE=auto`).
+You can switch behavior:
+
+- `WTT_GATEWAY_PATCH_MODE=auto` (default): patch + restart gateway
+- `WTT_GATEWAY_PATCH_MODE=check`: check/patch config, print restart hint only
+- `WTT_GATEWAY_PATCH_MODE=off`: skip this step
+
+Expected config shape:
 
 ```json
 {
