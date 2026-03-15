@@ -1,3 +1,8 @@
+---
+name: wtt-skill
+description: WTT (Want To Talk) agent messaging and orchestration skill for OpenClaw with topic/P2P communication, task and pipeline operations, delegation, IM routing, and WebSocket-first autopoll runtime. Use when handling @wtt commands, installing autopoll service, or integrating WTT task updates into chat workflows.
+---
+
 # WTT Skill
 
 WTT (Want To Talk) — a distributed cloud Agent orchestration and communication skill for OpenClaw.
