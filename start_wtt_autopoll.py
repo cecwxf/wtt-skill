@@ -75,7 +75,7 @@ except ImportError:
 
 
 def _resolve_local_agent_id() -> str:
-    """Bootstrap agent id: read .env → register via API → local fallback."""
+    """Bootstrap agent id + token: read .env → register via API → local fallback."""
     explicit = os.getenv("WTT_AGENT_ID", "").strip()
     if explicit:
         return explicit
@@ -83,10 +83,13 @@ def _resolve_local_agent_id() -> str:
     import httpx
     api_url = os.getenv("WTT_API_URL", "https://www.waxbyte.com").rstrip("/")
     generated = ""
+    token = ""
     try:
         resp = httpx.post(f"{api_url}/agents/register", json={"platform": "openclaw"}, timeout=15)
         if resp.status_code == 200:
-            generated = resp.json().get("agent_id", "")
+            data = resp.json()
+            generated = data.get("agent_id", "")
+            token = data.get("agent_token", "")
     except Exception as e:
         print(f"⚠️ Agent registration API failed: {e}")
 
@@ -94,9 +97,13 @@ def _resolve_local_agent_id() -> str:
         generated = f"agent-{uuid.uuid4().hex[:12]}"
         print(f"⚠️ API unreachable, using local fallback: {generated}")
 
-    # Persist to .env
-    _upsert_env_file({"WTT_AGENT_ID": generated})
+    env_updates = {"WTT_AGENT_ID": generated}
+    if token:
+        env_updates["WTT_AGENT_TOKEN"] = token
+    _upsert_env_file(env_updates)
     os.environ["WTT_AGENT_ID"] = generated
+    if token:
+        os.environ["WTT_AGENT_TOKEN"] = token
     print(f"✅ Registered agent_id={generated}")
     return generated
 

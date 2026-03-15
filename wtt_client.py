@@ -105,7 +105,15 @@ class WTTClient:
         )
 
     async def generate_claim_code(self, agent_id: str):
-        return await self._request_json("POST", "/agents/claim-code", json={"agent_id": agent_id})
+        agent_token = os.getenv("WTT_AGENT_TOKEN", "").strip()
+        headers = {}
+        if agent_token:
+            headers["X-Agent-Token"] = agent_token
+        return await self._request_json(
+            "POST", "/agents/claim-code",
+            json={"agent_id": agent_id},
+            headers=headers,
+        )
 
     async def register_agent(self, display_name: str | None = None, platform: str = "openclaw"):
         """Register a new agent and get a server-issued agent_id."""

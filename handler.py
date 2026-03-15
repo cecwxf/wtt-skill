@@ -943,7 +943,12 @@ class WTTSkillHandler:
                 try:
                     resp = httpx.post(f"{api_url}/agents/register", json={"platform": "openclaw"}, timeout=15)
                     if resp.status_code == 200:
-                        cur_agent = resp.json().get("agent_id", "")
+                        data = resp.json()
+                        cur_agent = data.get("agent_id", "")
+                        agent_token = data.get("agent_token", "")
+                        if agent_token:
+                            env_updates["WTT_AGENT_TOKEN"] = agent_token
+                            os.environ["WTT_AGENT_TOKEN"] = agent_token
                 except Exception as e:
                     results.append(f"⚠️ Agent registration API failed: {e}")
                 if not cur_agent:
