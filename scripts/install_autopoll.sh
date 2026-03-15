@@ -3,31 +3,55 @@ set -euo pipefail
 
 SCRIPT_PATH="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
-SKILLS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Fixed install location: ~/.openclaw/workspace/skills/wtt-skill
-SKILL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-START_SCRIPT="$SKILL_ROOT/start_wtt_autopoll.py"
-if [[ ! -f "$START_SCRIPT" ]]; then
-  echo "❌ start_wtt_autopoll.py not found: $START_SCRIPT"
-  echo "Expected install path: ~/.openclaw/workspace/skills/wtt-skill"
+resolve_skill_root() {
+  local candidates=(
+    "$(cd "$SCRIPT_DIR/.." && pwd)"
+    "$REPO_ROOT"
+    "$HOME/.openclaw/skills/wtt"
+    "$HOME/.openclaw/skills/wtt-skill"
+    "$HOME/.openclaw/workspace/skills/wtt-skill"
+  )
+  local c
+  for c in "${candidates[@]}"; do
+    if [[ -f "$c/start_wtt_autopoll.py" ]]; then
+      echo "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+SKILL_ROOT="$(resolve_skill_root || true)"
+if [[ -z "$SKILL_ROOT" ]]; then
+  echo "❌ start_wtt_autopoll.py not found. Checked:"
+  echo "   - $(cd "$SCRIPT_DIR/.." && pwd)"
+  echo "   - $REPO_ROOT"
+  echo "   - $HOME/.openclaw/skills/wtt"
+  echo "   - $HOME/.openclaw/skills/wtt-skill"
+  echo "   - $HOME/.openclaw/workspace/skills/wtt-skill"
   exit 1
 fi
 
+START_SCRIPT="$SKILL_ROOT/start_wtt_autopoll.py"
 WORKDIR="$SKILL_ROOT"
+WRAPPER_SCRIPT="$SKILL_ROOT/run_autopoll.sh"
+
+# Resolve runtime python: explicit override > skill-local venv > create skill-local venv > python3
 PY_BIN="${PY_BIN:-}"
 if [[ -z "$PY_BIN" ]]; then
-  if [[ -x "$WORKSPACE_ROOT/.venv311/bin/python" ]]; then
-    PY_BIN="$WORKSPACE_ROOT/.venv311/bin/python"
-    WORKDIR="$WORKSPACE_ROOT"
-  elif [[ -x "$SKILLS_ROOT/.venv311/bin/python" ]]; then
-    PY_BIN="$SKILLS_ROOT/.venv311/bin/python"
-    WORKDIR="$SKILLS_ROOT"
-  elif command -v python3.11 >/dev/null 2>&1; then
-    PY_BIN="$(command -v python3.11)"
+  if [[ -x "$SKILL_ROOT/.venv/bin/python" ]]; then
+    PY_BIN="$SKILL_ROOT/.venv/bin/python"
   else
-    PY_BIN="$(command -v python3 || true)"
+    BASE_PY="$(command -v python3 || true)"
+    if [[ -n "$BASE_PY" ]]; then
+      if "$BASE_PY" -m venv "$SKILL_ROOT/.venv" >/dev/null 2>&1; then
+        PY_BIN="$SKILL_ROOT/.venv/bin/python"
+      else
+        PY_BIN="$BASE_PY"
+      fi
+    fi
   fi
 fi
 
@@ -39,19 +63,6 @@ fi
 OPENCLAW_BIN="${OPENCLAW_BIN:-$(command -v openclaw || true)}"
 SERVICE_PATH="${PATH:-/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}"
 ENV_FILE="$SKILL_ROOT/.env"
-if [[ -z "$OPENCLAW_BIN" ]]; then
-  # common non-login-shell locations (Linux/macOS)
-  for cand in \
-    "$HOME/.local/share/pnpm/openclaw" \
-    "$HOME/.npm-global/bin/openclaw" \
-    "$HOME/.nvm/versions/node"/*/bin/openclaw \
-    "$HOME/.local/share/fnm/node-versions"/*/installation/bin/openclaw; do
-    if [[ -x "$cand" ]]; then
-      OPENCLAW_BIN="$cand"
-      break
-    fi
-  done
-fi
 if [[ -z "$OPENCLAW_BIN" ]]; then
   OPENCLAW_BIN="openclaw"
 fi
@@ -74,29 +85,73 @@ ensure_python_deps() {
   local missing
   missing="$($PY_BIN - <<'PY'
 import importlib.util
-mods = ["httpx", "websockets", "socksio"]
+mods = ["httpx", "websockets", "dotenv", "socksio"]
 print(" ".join([m for m in mods if importlib.util.find_spec(m) is None]))
 PY
 )"
 
   if [[ -z "${missing// }" ]]; then
-    echo "✅ Python runtime deps already present (httpx, websockets, socksio)"
+    echo "✅ Python runtime deps already present (httpx, websockets, python-dotenv, socksio)"
     return 0
   fi
 
   local pip_args=("--disable-pip-version-check")
-  if [[ -z "${VIRTUAL_ENV:-}" ]] \
-     && [[ "$PY_BIN" != "$WORKSPACE_ROOT/.venv311/bin/python" ]] \
-     && [[ "$PY_BIN" != "$SKILLS_ROOT/.venv311/bin/python" ]]; then
+  if [[ "$PY_BIN" != "$SKILL_ROOT/.venv/bin/python" ]] && [[ -z "${VIRTUAL_ENV:-}" ]]; then
     pip_args+=("--user")
   fi
 
   echo "ℹ️  Installing python deps for wtt-skill: $missing"
-  if ! "$PY_BIN" -m pip install "${pip_args[@]}" "httpx[socks]>=0.24" "websockets>=11" "socksio>=1.0.0"; then
-    # Ubuntu/Debian externally-managed Python fallback
-    "$PY_BIN" -m pip install --break-system-packages "${pip_args[@]}" "httpx[socks]>=0.24" "websockets>=11" "socksio>=1.0.0"
-  fi
+  "$PY_BIN" -m pip install "${pip_args[@]}" \
+    "httpx>=0.24" \
+    "websockets>=11" \
+    "python-dotenv>=1" \
+    "socksio>=1"
   echo "✅ Python deps installed"
+}
+
+ensure_wrapper_script() {
+  if [[ ! -f "$WRAPPER_SCRIPT" ]]; then
+    cat > "$WRAPPER_SCRIPT" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+SKILL_DIR="${WTT_SKILL_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+cd "$SKILL_DIR"
+
+choose_py() {
+  local c
+  if [[ -n "${WTT_PY_BIN:-}" ]] && [[ -x "${WTT_PY_BIN}" ]]; then
+    echo "${WTT_PY_BIN}"
+    return 0
+  fi
+
+  local candidates=(
+    "$SKILL_DIR/.venv/bin/python"
+    "$SKILL_DIR/.venv311/bin/python"
+    "$HOME/.openclaw/workspace/skills/.venv311/bin/python"
+  )
+
+  for c in "${candidates[@]}"; do
+    if [[ -x "$c" ]]; then
+      echo "$c"
+      return 0
+    fi
+  done
+
+  command -v python3
+}
+
+PY="$(choose_py)"
+if [[ -z "$PY" || ! -x "$PY" ]]; then
+  echo "❌ No runnable python found for wtt autopoll"
+  exit 1
+fi
+
+exec "$PY" "$SKILL_DIR/start_wtt_autopoll.py"
+SH
+  fi
+
+  chmod +x "$WRAPPER_SCRIPT"
 }
 
 init_env_file() {
@@ -146,21 +201,12 @@ EOF
   echo "✅ Checked required .env keys: $ENV_FILE"
 }
 
-echo "ℹ️  WORKSPACE_ROOT:$WORKSPACE_ROOT"
-echo "ℹ️  SKILLS_ROOT:  $SKILLS_ROOT"
-echo "ℹ️  SKILL_ROOT:   $SKILL_ROOT"
-echo "ℹ️  WORKDIR:      $WORKDIR"
-echo "ℹ️  START_SCRIPT: $START_SCRIPT"
-echo "ℹ️  PY_BIN:       $PY_BIN"
-
-USER_SITE="$($PY_BIN - <<'PY'
-import site
-try:
-    print(site.getusersitepackages())
-except Exception:
-    print("")
-PY
-)"
+echo "ℹ️  REPO_ROOT:       $REPO_ROOT"
+echo "ℹ️  SKILL_ROOT:      $SKILL_ROOT"
+echo "ℹ️  WORKDIR:         $WORKDIR"
+echo "ℹ️  START_SCRIPT:    $START_SCRIPT"
+echo "ℹ️  WRAPPER_SCRIPT:  $WRAPPER_SCRIPT"
+echo "ℹ️  PY_BIN(selected): $PY_BIN"
 
 autostart_mac() {
   local plist="$HOME/Library/LaunchAgents/com.openclaw.wtt.autopoll.plist"
@@ -176,8 +222,7 @@ autostart_mac() {
 
     <key>ProgramArguments</key>
     <array>
-      <string>$PY_BIN</string>
-      <string>$START_SCRIPT</string>
+      <string>$WRAPPER_SCRIPT</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -191,10 +236,10 @@ autostart_mac() {
       <string>$SERVICE_PATH</string>
       <key>OPENCLAW_BIN</key>
       <string>$OPENCLAW_BIN</string>
-      <key>HOME</key>
-      <string>$HOME</string>
-      <key>PYTHONPATH</key>
-      <string>$USER_SITE</string>
+      <key>WTT_SKILL_DIR</key>
+      <string>$SKILL_ROOT</string>
+      <key>WTT_PY_BIN</key>
+      <string>$PY_BIN</string>
     </dict>
 
     <key>StandardOutPath</key>
@@ -225,13 +270,14 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$PY_BIN $START_SCRIPT
+ExecStart=$WRAPPER_SCRIPT
 Restart=always
 RestartSec=2
 Environment="PATH=$SERVICE_PATH"
 Environment="OPENCLAW_BIN=$OPENCLAW_BIN"
 Environment="HOME=$HOME"
-Environment="PYTHONPATH=$USER_SITE"
+Environment="WTT_SKILL_DIR=$SKILL_ROOT"
+Environment="WTT_PY_BIN=$PY_BIN"
 WorkingDirectory=$WORKDIR
 StandardOutput=append:/tmp/wtt_autopoll.log
 StandardError=append:/tmp/wtt_autopoll_error.log
@@ -248,6 +294,7 @@ UNIT
 }
 
 init_env_file
+ensure_wrapper_script
 ensure_python_deps
 
 case "$(uname -s)" in
