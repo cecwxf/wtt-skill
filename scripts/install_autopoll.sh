@@ -305,8 +305,6 @@ autostart_mac() {
       <string>$OPENCLAW_BIN</string>
       <key>WTT_SKILL_DIR</key>
       <string>$SKILL_ROOT</string>
-      <key>WTT_PY_BIN</key>
-      <string>$PY_BIN</string>
     </dict>
 
     <key>StandardOutPath</key>
@@ -344,7 +342,6 @@ Environment="PATH=$SERVICE_PATH"
 Environment="OPENCLAW_BIN=$OPENCLAW_BIN"
 Environment="HOME=$HOME"
 Environment="WTT_SKILL_DIR=$SKILL_ROOT"
-Environment="WTT_PY_BIN=$PY_BIN"
 WorkingDirectory=$WORKDIR
 StandardOutput=append:/tmp/wtt_autopoll.log
 StandardError=append:/tmp/wtt_autopoll_error.log
