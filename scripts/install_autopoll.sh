@@ -367,6 +367,8 @@ echo "ℹ️  PY_BIN(selected): $PY_BIN"
 
 autostart_mac() {
   local plist="$HOME/Library/LaunchAgents/com.openclaw.wtt.autopoll.plist"
+  local label="com.openclaw.wtt.autopoll"
+  local domain="gui/$(id -u)"
   mkdir -p "$HOME/Library/LaunchAgents"
 
   cat > "$plist" <<PLIST
@@ -375,7 +377,7 @@ autostart_mac() {
 <plist version="1.0">
   <dict>
     <key>Label</key>
-    <string>com.openclaw.wtt.autopoll</string>
+    <string>$label</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -405,12 +407,28 @@ autostart_mac() {
 </plist>
 PLIST
 
-  launchctl bootout "gui/$(id -u)/com.openclaw.wtt.autopoll" >/dev/null 2>&1 || true
-  launchctl bootstrap "gui/$(id -u)" "$plist"
-  launchctl kickstart -k "gui/$(id -u)/com.openclaw.wtt.autopoll"
+  launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
 
-  echo "✅ macOS launchd service installed"
-  launchctl list | grep com.openclaw.wtt.autopoll || true
+  # In non-GUI/session-limited contexts, bootstrap may fail with I/O error.
+  # Treat this as deferred install (plist written), not hard failure.
+  if launchctl bootstrap "$domain" "$plist" >/dev/null 2>&1; then
+    launchctl kickstart -k "$domain/$label" >/dev/null 2>&1 || true
+    echo "✅ macOS launchd service installed"
+    launchctl list | grep "$label" || true
+    return 0
+  fi
+
+  if launchctl list | grep -q "$label"; then
+    launchctl kickstart -k "$domain/$label" >/dev/null 2>&1 || true
+    echo "✅ macOS launchd service already loaded"
+    launchctl list | grep "$label" || true
+    return 0
+  fi
+
+  echo "ℹ️  launchd bootstrap deferred (non-interactive/GUI context)."
+  echo "   Plist is ready: $plist"
+  echo "   Run in your macOS user session: launchctl bootstrap $domain $plist && launchctl kickstart -k $domain/$label"
+  return 0
 }
 
 autostart_linux() {
