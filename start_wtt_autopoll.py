@@ -156,8 +156,6 @@ class OpenClawAgent:
         # task_id -> independent sessionKey (reused for follow-ups via sessions_send)
         self.task_session_keys: dict[str, str] = {}
         self.topic_session_keys: dict[str, str] = {}  # non-task topic_id -> independent sessionKey
-        # task_id -> last result text (fallback context when session expires)
-        self.task_last_results: dict[str, str] = {}
 
     def _parse_csv(self, value: str) -> List[str]:
         return [x.strip() for x in (value or '').split(',') if x.strip()]
@@ -552,25 +550,89 @@ class OpenClawAgent:
                     continue
                 raise RuntimeError(str(last_err))
 
-    async def _execute_by_agent(self, task_id: str, title: str, description: str, session_id: str, is_followup: bool = False) -> tuple[list[str], list[str], str, str, str]:
+    async def _execute_by_agent(self, task_id: str, title: str, description: str, session_id: str, is_followup: bool = False, original_description: str = "") -> tuple[list[str], list[str], str, str, str]:
         """执行任务推理：每个 task 维护一个独立 session。
         首次运行 spawn 新 session，后续 follow-up 通过 sessions_send 追加。
-        独立 session 无父子通信开销，比 subagent 更轻量。
+        Session 销毁后从 OpenClaw 恢复对话历史（cleanup:'keep' 保留历史），
+        通过 sessions_spawn(context=...) 注入新 session。
+        不在 DB 存对话历史 — OpenClaw 本身就是对话历史的唯一存储源。
+        若 OpenClaw 历史也丢失，退化为 rerun+follow：重新执行原始任务并附加 follow-up。
         """
         cached_key = self.task_session_keys.get(task_id)
+        dead_session_key = None  # remember dead key for history recovery
 
-        # 尝试从 DB 恢复（进程重启后 )
+        # 尝试从 DB 恢复 session key（进程重启后）
         if not cached_key:
             cached_key = await self._load_task_session_key_from_db(task_id)
             if cached_key:
                 self.task_session_keys[task_id] = cached_key
 
+        # Pre-validate: if we have a cached session, verify it's still alive
+        if cached_key:
+            alive = await self._check_session_alive(cached_key)
+            if not alive:
+                print(f"⚠️ Cached session {cached_key[:20]} for task {task_id[:12]} is dead, will spawn new")
+                dead_session_key = cached_key  # keep for history recovery from OpenClaw
+                self.task_session_keys.pop(task_id, None)
+                # Don't clear session key from DB yet — we need it for history recovery
+                cached_key = None
+
+        # Recover context from OpenClaw when session is dead and we need follow-up
+        recovered_context = ""
+        if is_followup and not cached_key:
+            recover_key = dead_session_key
+            if not recover_key:
+                # Process may have restarted — try loading the old key from DB
+                recover_key = await self._load_task_session_key_from_db(task_id)
+            if recover_key:
+                recovered_context = await self._recover_history_from_openclaw(recover_key)
+            # Now safe to clear the dead session key from DB
+            if dead_session_key:
+                await self._clear_task_session_key_in_db(task_id)
+
         if is_followup and cached_key:
-            # 已有 session → sessions_send 追加消息（session 自带上下文 )
+            # 已有 session → sessions_send 追加消息（session 自带上下文）
             prompt = (
                 f"User sent a follow-up for task '{title}':\n"
                 f"{description}\n\n"
                 "Based on prior context, return an updated final answer only."
+            )
+        elif is_followup and not cached_key and recovered_context:
+            # Session dead, context recovered from OpenClaw — pass via context param
+            prompt = (
+                f"You are continuing a WTT task after session recovery.\n"
+                f"Task title: {title}\n"
+                f"User's follow-up:\n{description}\n\n"
+                "The previous conversation history is provided as context. "
+                "Based on ALL prior context, return an updated final answer only.\n"
+                "Requirements:\n"
+                "- Do not output STEP / MID / CHANGE / RESULT tags\n"
+                "- Provide conclusion/judgment/solution/final answer directly\n"
+            )
+        elif is_followup and not cached_key and not recovered_context:
+            # Session dead AND OpenClaw history gone → rerun original task + follow-up
+            orig = original_description
+            if not orig:
+                # Fallback: fetch original description from DB (covers reject rerun where description may be empty)
+                task_data = await self._get_task(task_id)
+                orig = (task_data.get("description") or "").strip()
+            if not orig:
+                orig = title  # last resort
+            print(f"🔄 Rerun+Follow: OpenClaw history lost for task {task_id[:12]}, re-executing original + follow-up")
+            prompt = (
+                "You are executing a WTT task. A previous session's history has been lost.\n"
+                "Please re-execute the original task first, then address the follow-up.\n\n"
+                f"=== Original Task ===\n"
+                f"Title: {title}\n"
+                f"Description: {orig}\n\n"
+                f"=== Follow-up Request ===\n"
+                f"{description}\n\n"
+                "Requirements:\n"
+                "- First fulfill the original task, then address the follow-up\n"
+                "- Output only the final combined answer\n"
+                "- Do not output STEP / MID / CHANGE / RESULT tags\n"
+                "- Do not include process narration\n"
+                "- Provide conclusion/judgment/solution/final answer directly\n"
             )
         else:
             prompt = (
@@ -593,15 +655,45 @@ class OpenClawAgent:
                     # 向已有 session 发送消息
                     merged = await self._send_and_poll(cached_key, prompt)
                     if merged is None:
-                        # session 可能已过期/失效，清缓存重建
+                        # session 已过期/失效，清缓存重建
+                        print(f"⚠️ Session dead for task {task_id[:12]}, clearing and retrying with new session")
+                        dead_session_key = cached_key
                         self.task_session_keys.pop(task_id, None)
+                        await self._clear_task_session_key_in_db(task_id)
                         cached_key = None
+                        # Recover context from OpenClaw
+                        if not recovered_context and dead_session_key:
+                            recovered_context = await self._recover_history_from_openclaw(dead_session_key)
+                        # If recovery also failed and this is a follow-up, rebuild prompt as rerun+follow
+                        if is_followup and not recovered_context:
+                            orig = original_description
+                            if not orig:
+                                task_data = await self._get_task(task_id)
+                                orig = (task_data.get("description") or "").strip()
+                            if not orig:
+                                orig = title
+                            print(f"🔄 Mid-exec rerun+follow: history lost for task {task_id[:12]}")
+                            prompt = (
+                                "You are executing a WTT task. A previous session's history has been lost.\n"
+                                "Please re-execute the original task first, then address the follow-up.\n\n"
+                                f"=== Original Task ===\n"
+                                f"Title: {title}\n"
+                                f"Description: {orig}\n\n"
+                                f"=== Follow-up Request ===\n"
+                                f"{description}\n\n"
+                                "Requirements:\n"
+                                "- First fulfill the original task, then address the follow-up\n"
+                                "- Output only the final combined answer\n"
+                                "- Do not output STEP / MID / CHANGE / RESULT tags\n"
+                                "- Provide conclusion/judgment/solution/final answer directly\n"
+                            )
                         raise RuntimeError("session send returned empty, will retry with new session")
                 else:
-                    # 创建新的独立 session
+                    # 创建新的独立 session (pass recovered_context via context param)
                     new_key, merged = await self._spawn_session_and_poll(
                         prompt,
                         label=f"wtt-task-{task_id[:12]}",
+                        context=recovered_context,
                     )
                     if new_key:
                         self.task_session_keys[task_id] = new_key
@@ -609,9 +701,6 @@ class OpenClawAgent:
                         cached_key = new_key
                     if not merged:
                         raise RuntimeError("session returned empty result")
-
-                # Cache result as fallback context
-                self.task_last_results[task_id] = (merged or "")[:4000]
 
                 steps, mids, changes, final = [], [], [], merged
                 for line in (merged or "").splitlines():
@@ -632,28 +721,79 @@ class OpenClawAgent:
                     continue
                 raise RuntimeError(str(last_err))
 
-    async def _spawn_session_and_poll(self, prompt: str, label: str = "") -> tuple[Optional[str], Optional[str]]:
+    async def _recover_history_from_openclaw(self, dead_session_key: str) -> str:
+        """Try to extract conversation history from a dead OpenClaw session.
+        OpenClaw keeps session history persisted (cleanup: 'keep') even after
+        the session stops accepting new messages. Returns formatted context string
+        or empty string if unavailable."""
+        if not dead_session_key:
+            return ""
+        try:
+            hist = await self._invoke_tool("sessions_history", {
+                "sessionKey": dead_session_key,
+                "limit": 30,
+                "includeTools": False,
+            })
+            if not isinstance(hist, dict):
+                return ""
+            messages = hist.get("messages") or []
+            if not messages:
+                return ""
+            # Build context from OpenClaw's native history (richer than our DB copy)
+            parts = []
+            total = 0
+            for msg in messages:
+                role = str(msg.get("role", "")).upper()
+                text = str(msg.get("content") or msg.get("text") or "").strip()
+                if not text or role not in ("USER", "ASSISTANT"):
+                    continue
+                entry = f"[{role}]: {text[:2000]}"
+                if total + len(entry) > 6000:
+                    break
+                parts.append(entry)
+                total += len(entry)
+            if parts:
+                print(f"🔄 Recovered {len(parts)} turns from dead OpenClaw session {dead_session_key[:20]}")
+                return "\n---\n".join(parts)
+        except Exception as e:
+            print(f"🔍 Could not recover history from dead session {dead_session_key[:20]}: {e}")
+        return ""
+
+    async def _spawn_session_and_poll(self, prompt: str, label: str = "", context: str = "") -> tuple[Optional[str], Optional[str]]:
         """创建独立 session（非 subagent )，执行 prompt 并轮询结果。
         返回 (sessionKey, assistant_text)。sessionKey 可缓存复用。
+        context: optional prior conversation context to inject into the new session.
         """
         spawn_label = label or "wtt-task"
         child = None
+        spawn_params = {
+            "task": prompt,
+            "label": spawn_label,
+            "mode": "run",
+            "cleanup": "keep",
+            "runTimeoutSeconds": max(120, int(self.task_max_runtime_sec)),
+            "timeoutSeconds": 30,
+        }
+        # Pass context to OpenClaw if available (native session context injection)
+        if context:
+            spawn_params["context"] = context
         try:
-            spawn = await self._invoke_tool(
-                "sessions_spawn",
-                {
-                    "task": prompt,
-                    "label": spawn_label,
-                    "mode": "run",
-                    "cleanup": "keep",
-                    "runTimeoutSeconds": max(120, int(self.task_max_runtime_sec)),
-                    "timeoutSeconds": 30,
-                },
-            )
+            spawn = await self._invoke_tool("sessions_spawn", spawn_params)
             child = (spawn or {}).get("childSessionKey")
         except Exception as e:
             if "label already in use" in str(e) or "already in use" in str(e):
+                # Try to reuse existing session by label
                 child = await self._find_session_by_label(spawn_label)
+                if child and not await self._check_session_alive(child):
+                    # Old session is dead, retry with unique label suffix
+                    child = None
+                    unique_label = f"{spawn_label}-{int(time.time()) % 100000}"
+                    spawn_params["label"] = unique_label
+                    try:
+                        spawn = await self._invoke_tool("sessions_spawn", spawn_params)
+                        child = (spawn or {}).get("childSessionKey")
+                    except Exception:
+                        pass
             if not child:
                 raise
 
@@ -675,21 +815,86 @@ class OpenClawAgent:
 
         return child, None
 
+    async def _check_session_alive(self, session_key: str) -> bool:
+        """Check if a session is still alive. Uses sessions_history first,
+        falls back to sessions_list if history returns empty (some gateways
+        return empty dict for destroyed sessions instead of erroring)."""
+        short_key = session_key[:20] if session_key else "?"
+        try:
+            hist = await self._invoke_tool("sessions_history", {"sessionKey": session_key, "limit": 1, "includeTools": False})
+            if not isinstance(hist, dict):
+                print(f"🔍 Session {short_key} health: history returned non-dict → DEAD")
+                return False
+            # If history returned messages, session is definitely alive
+            msgs = hist.get("messages") or []
+            if msgs:
+                print(f"🔍 Session {short_key} health: has {len(msgs)} message(s) → ALIVE")
+                return True
+            # Empty messages could mean new session OR destroyed session.
+            # Verify via sessions_list as second opinion.
+            print(f"🔍 Session {short_key} health: history empty, checking sessions_list...")
+            try:
+                listed = await self._invoke_tool("sessions_list", {"limit": 200, "messageLimit": 0})
+                all_sessions = (listed or {}).get("sessions", []) or []
+                for s in all_sessions:
+                    if s.get("key") == session_key:
+                        print(f"🔍 Session {short_key} health: found in sessions_list → ALIVE")
+                        return True
+                print(f"🔍 Session {short_key} health: NOT in sessions_list ({len(all_sessions)} total) → DEAD")
+                return False
+            except Exception as e:
+                print(f"🔍 Session {short_key} health: sessions_list failed ({e}), assume ALIVE")
+                return True
+        except Exception as e:
+            print(f"🔍 Session {short_key} health: history error ({e}) → DEAD")
+            return False
+
     async def _send_and_poll(self, session_key: str, message: str) -> Optional[str]:
         """向已有独立 session 发送消息，轮询获取最新 assistant 回复。"""
+        short_key = session_key[:20] if session_key else "?"
+        # Pre-flight: verify session is still alive
+        if not await self._check_session_alive(session_key):
+            print(f"⚠️ _send_and_poll: session {short_key} failed pre-flight → returning None")
+            return None
+
         # 先获取当前 history 长度，以便只取新回复
         pre_hist = await self._invoke_tool("sessions_history", {"sessionKey": session_key, "limit": 50, "includeTools": False})
         pre_count = len(self._extract_assistant_texts(pre_hist))
 
-        send_result = await self._invoke_tool(
-            "sessions_send",
-            {"sessionKey": session_key, "message": message, "timeoutSeconds": 90},
-        )
+        try:
+            send_result = await self._invoke_tool(
+                "sessions_send",
+                {"sessionKey": session_key, "message": message, "timeoutSeconds": 90},
+            )
+        except Exception as e:
+            err_msg = str(e).lower()
+            if any(kw in err_msg for kw in ("not found", "invalid session", "expired", "terminated", "no such")):
+                print(f"⚠️ session {session_key[:20]} is dead: {e}")
+                return None
+            raise
+
         if not send_result and send_result is not None:
             pass  # some gateways return empty on success
 
-        deadline = time.time() + max(120, int(self.task_max_runtime_sec))
+        # Phase 1: short wait for initial response (detect dead sessions fast)
+        early_deadline = time.time() + 15
         poll_interval = 1.0
+        got_early = False
+        while time.time() < early_deadline:
+            hist = await self._invoke_tool("sessions_history", {"sessionKey": session_key, "limit": 50, "includeTools": False})
+            err = self._extract_assistant_error(hist)
+            if err:
+                raise RuntimeError(err)
+            texts = self._extract_assistant_texts(hist)
+            if texts and len(texts) > pre_count:
+                return texts[-1].strip()
+            # Check if session is processing (messages count changed or status hints)
+            await asyncio.sleep(poll_interval)
+            poll_interval = min(poll_interval * 1.3, 3.0)
+
+        # Phase 2: extended wait (session is likely still working, just slow)
+        deadline = time.time() + max(90, int(self.task_max_runtime_sec) - 30)
+        poll_interval = 2.0
         while time.time() < deadline:
             hist = await self._invoke_tool("sessions_history", {"sessionKey": session_key, "limit": 50, "includeTools": False})
             err = self._extract_assistant_error(hist)
@@ -699,8 +904,9 @@ class OpenClawAgent:
             if texts and len(texts) > pre_count:
                 return texts[-1].strip()
             await asyncio.sleep(poll_interval)
-            poll_interval = min(poll_interval * 1.3, 3.0)
+            poll_interval = min(poll_interval * 1.3, 5.0)
 
+        print(f"⚠️ _send_and_poll: session {short_key} timed out after both phases → returning None")
         return None
 
     def _normalize_task_id(self, raw: str) -> str:
@@ -1168,7 +1374,11 @@ class OpenClawAgent:
                 runtime_action = "Reasoning started, preparing final answer"
 
                 # 执行推理：即时完成即时回写；进度上报改为独立 ticker（避免主执行链路阻塞时丢分钟上报 )
-                exec_task = asyncio.create_task(self._execute_by_agent(task_id, title, run_desc, session_id, is_followup=is_followup))
+                exec_task = asyncio.create_task(self._execute_by_agent(
+                    task_id, title, run_desc, session_id,
+                    is_followup=is_followup,
+                    original_description=description if is_followup else "",
+                ))
 
                 async def _task_progress_ticker():
                     last_report_no = 0
