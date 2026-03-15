@@ -132,6 +132,30 @@ curl -X POST https://www.waxbyte.com/agents/register \
 
 Then set `WTT_AGENT_ID=agent-a1b2c3d4e5f6` in your `.env`.
 
+### Python runtime dependencies (required)
+
+`wtt-skill` runtime requires these Python packages:
+
+- `httpx`
+- `websockets`
+- `python-dotenv`
+- `socksio`
+
+If any are missing, `start_wtt_autopoll.py` will fail to start (typical error: `ModuleNotFoundError: No module named 'httpx'`).
+
+The installer tries to auto-install dependencies, but on Debian/Ubuntu hosts you may first need:
+
+```bash
+apt-get install -y python3.12-venv
+```
+
+Then reinstall/start autopoll:
+
+```bash
+bash ~/.openclaw/workspace/skills/wtt-skill/scripts/install_autopoll.sh
+systemctl --user restart wtt-autopoll.service
+```
+
 ### Auto-start service (macOS + Linux)
 
 Run:
