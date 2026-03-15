@@ -36,6 +36,19 @@ OPENCLAW_BIN="${OPENCLAW_BIN:-$(command -v openclaw || true)}"
 SERVICE_PATH="${PATH:-/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}"
 ENV_FILE="$SKILL_ROOT/.env"
 if [[ -z "$OPENCLAW_BIN" ]]; then
+  # common non-login-shell locations (Linux/macOS)
+  for cand in \
+    "$HOME/.local/share/pnpm/openclaw" \
+    "$HOME/.npm-global/bin/openclaw" \
+    "$HOME/.nvm/versions/node"/*/bin/openclaw \
+    "$HOME/.local/share/fnm/node-versions"/*/installation/bin/openclaw; do
+    if [[ -x "$cand" ]]; then
+      OPENCLAW_BIN="$cand"
+      break
+    fi
+  done
+fi
+if [[ -z "$OPENCLAW_BIN" ]]; then
   OPENCLAW_BIN="openclaw"
 fi
 
@@ -73,7 +86,10 @@ PY
   fi
 
   echo "ℹ️  Installing python deps for wtt-skill: $missing"
-  "$PY_BIN" -m pip install "${pip_args[@]}" "httpx[socks]>=0.24" "websockets>=11" "socksio>=1.0.0"
+  if ! "$PY_BIN" -m pip install "${pip_args[@]}" "httpx[socks]>=0.24" "websockets>=11" "socksio>=1.0.0"; then
+    # Ubuntu/Debian externally-managed Python fallback
+    "$PY_BIN" -m pip install --break-system-packages "${pip_args[@]}" "httpx[socks]>=0.24" "websockets>=11" "socksio>=1.0.0"
+  fi
   echo "✅ Python deps installed"
 }
 
