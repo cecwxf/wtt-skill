@@ -40,6 +40,25 @@ def _load_local_env(env_path: str):
 
 PLAN_PREFIX = "WTT_PLAN_JSON:"
 
+
+def _acquire_pid_lock() -> bool:
+    """Ensure only one instance runs. Returns True if lock acquired."""
+    import fcntl
+    pid_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".autopoll.pid")
+    try:
+        _acquire_pid_lock._fd = open(pid_path, "w")
+        fcntl.flock(_acquire_pid_lock._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _acquire_pid_lock._fd.write(str(os.getpid()))
+        _acquire_pid_lock._fd.flush()
+        return True
+    except (OSError, IOError):
+        print(f"⚠️ Another autopoll instance is already running (lock: {pid_path}). Exiting.")
+        return False
+
+
+if not _acquire_pid_lock():
+    sys.exit(0)
+
 # Path resolution: script is in skill dir; project_root is parent if mcp_server exists
 _script_path = Path(__file__).resolve()
 _skill_root = str(_script_path.parent)

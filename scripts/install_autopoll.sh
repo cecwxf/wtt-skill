@@ -416,11 +416,17 @@ PLIST
   for d in "${domains[@]}"; do
     if launchctl bootstrap "$d" "$plist" >/dev/null 2>&1; then
       launchctl kickstart -k "$d/$label" >/dev/null 2>&1 || true
+      # Give process a moment to start before checking state
+      sleep 2
       if launchctl print "$d/$label" 2>/dev/null | grep -q "state = running"; then
-        echo "✅ macOS launchd service installed"
+        echo "✅ macOS launchd service installed (domain: $d)"
         launchctl list | grep "$label" || true
         return 0
       fi
+      # Bootstrap succeeded even if state check failed — don't try another domain
+      echo "✅ macOS launchd service bootstrapped (domain: $d)"
+      launchctl list | grep "$label" || true
+      return 0
     fi
   done
 
