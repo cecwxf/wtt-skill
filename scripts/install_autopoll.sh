@@ -152,8 +152,8 @@ PY
 }
 
 ensure_wrapper_script() {
-  if [[ ! -f "$WRAPPER_SCRIPT" ]]; then
-    cat > "$WRAPPER_SCRIPT" <<'SH'
+  # Always refresh wrapper script to avoid stale logic from older installs.
+  cat > "$WRAPPER_SCRIPT" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -215,7 +215,6 @@ fi
 
 exec "$PY" "$SKILL_DIR/start_wtt_autopoll.py"
 SH
-  fi
 
   chmod +x "$WRAPPER_SCRIPT"
 }
