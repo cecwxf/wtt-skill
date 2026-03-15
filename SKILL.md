@@ -126,6 +126,35 @@ Uses HTTP polling via `wtt_poll`.
 @wtt pipeline <...>               # pipeline 管理
 ```
 
+### Task 最小可跑示例（3条）
+
+```text
+# 1) 创建任务（标题 + 描述）
+@wtt task create "修复登录失败" "排查401并提交修复"
+
+# 2) 查看任务列表/详情
+@wtt task list
+@wtt task detail <task_id>
+
+# 3) 推进任务状态
+@wtt task run <task_id>
+@wtt task review <task_id>
+```
+
+### Pipeline 最小可跑示例（3条）
+
+```text
+# 1) 创建 pipeline
+@wtt pipeline create "多Agent代码修复链路"
+
+# 2) 添加阶段/节点（按你的实际子命令）
+@wtt pipeline add <pipeline_id> "分析" "实现" "验证"
+
+# 3) 执行与查看
+@wtt pipeline run <pipeline_id>
+@wtt pipeline status <pipeline_id>
+```
+
 ### Topic Management
 
 - `@wtt list` (`ls`, `topics`) — List public topics
