@@ -12,6 +12,7 @@ import re
 import subprocess
 import shutil
 import time
+import uuid
 import urllib.request
 import urllib.error
 from typing import List, Tuple, Optional
@@ -74,36 +75,50 @@ except ImportError:
 
 
 def _resolve_local_agent_id() -> str:
-    """Resolve agent id from .env first; auto-generate and write back to .env when absent."""
+    """Bootstrap agent id: read .env → register via API → local fallback."""
     explicit = os.getenv("WTT_AGENT_ID", "").strip()
     if explicit:
         return explicit
 
-    generated = str(10_000_000 + int(time.time() * 1000) % 90_000_000)
-    env_path = Path(_skill_root) / ".env"
+    import httpx
+    api_url = os.getenv("WTT_API_URL", "https://www.waxbyte.com").rstrip("/")
+    generated = ""
     try:
-        lines = []
-        if env_path.exists() and env_path.is_file():
-            lines = env_path.read_text(encoding="utf-8").splitlines()
+        resp = httpx.post(f"{api_url}/agents/register", json={"platform": "openclaw"}, timeout=15)
+        if resp.status_code == 200:
+            generated = resp.json().get("agent_id", "")
+    except Exception as e:
+        print(f"⚠️ Agent registration API failed: {e}")
 
-        has_agent = False
+    if not generated:
+        generated = f"agent-{uuid.uuid4().hex[:12]}"
+        print(f"⚠️ API unreachable, using local fallback: {generated}")
+
+    # Persist to .env
+    _upsert_env_file({"WTT_AGENT_ID": generated})
+    os.environ["WTT_AGENT_ID"] = generated
+    print(f"✅ Registered agent_id={generated}")
+    return generated
+
+
+def _upsert_env_file(updates: dict[str, str]) -> None:
+    """Write key=value pairs into the skill .env file (create or update)."""
+    env_path = Path(_skill_root) / ".env"
+    lines = []
+    if env_path.exists() and env_path.is_file():
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    for k, v in updates.items():
+        replaced = False
         for i, line in enumerate(lines):
-            if line.strip().startswith("WTT_AGENT_ID="):
-                lines[i] = f"WTT_AGENT_ID={generated}"
-                has_agent = True
+            if line.strip().startswith(f"{k}="):
+                lines[i] = f"{k}={v}"
+                replaced = True
                 break
-        if not has_agent:
+        if not replaced:
             if lines and lines[-1].strip() != "":
                 lines.append("")
-            lines.append(f"WTT_AGENT_ID={generated}")
-
-        env_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-        os.environ["WTT_AGENT_ID"] = generated
-        print(f"ℹ️ WTT_AGENT_ID not configured; wrote value to {env_path}")
-    except Exception as e:
-        print(f"⚠️ Failed to write WTT_AGENT_ID to .env({env_path}): {e}")
-
-    return generated
+            lines.append(f"{k}={v}")
+    env_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
 class OpenClawAgent:

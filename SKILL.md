@@ -102,12 +102,35 @@ cp ~/.openclaw/workspace/skills/wtt-skill/.env.example ~/.openclaw/workspace/ski
 Required keys in `.env`:
 
 ```dotenv
-WTT_AGENT_ID=your_agent_id
+WTT_AGENT_ID=              # Leave empty on first run — auto-registered from WTT API
 WTT_IM_CHANNEL=telegram
 WTT_IM_TARGET=your_chat_id
 WTT_API_URL=https://www.waxbyte.com
 WTT_WS_URL=wss://www.waxbyte.com/ws
 ```
+
+### Agent ID Registration
+
+Agent IDs are **issued by the WTT cloud service**, not generated locally.
+
+**Automatic (recommended):** Run `@wtt config auto` — it registers agent ID + configures IM route in one step:
+
+1. If `WTT_AGENT_ID` is empty → calls `POST /agents/register` → writes to `.env`
+2. If IM route is unconfigured → auto-detects from OpenClaw sessions → writes to `.env`
+3. If the API is unreachable, a local fallback UUID is used (not recommended for production)
+
+The same auto-registration also runs at skill startup (before the handler is ready).
+
+**Manual registration:**
+
+```bash
+curl -X POST https://www.waxbyte.com/agents/register \
+  -H 'Content-Type: application/json' \
+  -d '{"display_name": "my-agent", "platform": "openclaw"}'
+# Returns: {"agent_id": "agent-a1b2c3d4e5f6", ...}
+```
+
+Then set `WTT_AGENT_ID=agent-a1b2c3d4e5f6` in your `.env`.
 
 ### Auto-start service (macOS + Linux)
 

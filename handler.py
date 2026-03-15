@@ -924,39 +924,60 @@ class WTTSkillHandler:
         arg = (args or "").strip().lower()
 
         if arg in {"auto", "init", "setup"}:
+            results: list[str] = []
+            env_updates: Dict[str, str] = {}
+
+            # --- Step 1: ensure agent_id is registered ---
+            cur_agent = os.getenv("WTT_AGENT_ID", "").strip()
+            if not cur_agent:
+                import httpx, uuid as _uuid
+                api_url = os.getenv("WTT_API_URL", "https://www.waxbyte.com").rstrip("/")
+                try:
+                    resp = httpx.post(f"{api_url}/agents/register", json={"platform": "openclaw"}, timeout=15)
+                    if resp.status_code == 200:
+                        cur_agent = resp.json().get("agent_id", "")
+                except Exception as e:
+                    results.append(f"⚠️ Agent registration API failed: {e}")
+                if not cur_agent:
+                    cur_agent = f"agent-{_uuid.uuid4().hex[:12]}"
+                    results.append(f"⚠️ API unreachable, using local fallback: {cur_agent}")
+                env_updates["WTT_AGENT_ID"] = cur_agent
+                os.environ["WTT_AGENT_ID"] = cur_agent
+                self.agent_id = cur_agent
+                try:
+                    self.agent.agent_id = cur_agent
+                except Exception:
+                    pass
+                results.append(f"✅ agent_id registered: {cur_agent}")
+            else:
+                results.append(f"ℹ️ agent_id already set: {cur_agent}")
+
+            # --- Step 2: auto-detect IM route ---
             cur_channel, cur_targets = self._get_runtime_im_config()
             if cur_channel and cur_targets:
-                return (
-                    "Already configured. Auto-setup is not required.\n"
-                    f"im_channel: {cur_channel}\n"
-                    f"im_target(s): {', '.join(cur_targets)}"
-                )
+                results.append(f"ℹ️ IM route already configured: {cur_channel} → {', '.join(cur_targets)}")
+            else:
+                ch, target, src = self._discover_im_route_from_sessions()
+                if ch and target:
+                    env_updates["WTT_IM_CHANNEL"] = ch
+                    env_updates["WTT_IM_TARGET"] = target
+                    os.environ["WTT_IM_CHANNEL"] = ch
+                    os.environ["WTT_IM_TARGET"] = target
+                    try:
+                        setattr(self.agent, "im_channel", ch)
+                        setattr(self.agent, "im_targets", [target])
+                    except Exception:
+                        pass
+                    results.append(f"✅ IM route auto-configured: {ch} → {target} (from {src})")
+                else:
+                    results.append("⚠️ IM route: no direct session detected. Set WTT_IM_CHANNEL / WTT_IM_TARGET manually")
 
-            ch, target, src = self._discover_im_route_from_sessions()
-            if not ch or not target:
-                return (
-                    "Auto-config failed: no recent direct IM session detected.\n"
-                    "Please set: WTT_IM_CHANNEL / WTT_IM_TARGET"
-                )
+            # --- Persist all changes ---
+            if env_updates:
+                env_path = self._upsert_env(env_updates)
+                results.append(f"📄 Saved to {env_path}")
 
-            env_path = self._upsert_env({
-                "WTT_IM_CHANNEL": ch,
-                "WTT_IM_TARGET": target,
-            })
-            os.environ["WTT_IM_CHANNEL"] = ch
-            os.environ["WTT_IM_TARGET"] = target
-            try:
-                setattr(self.agent, "im_channel", ch)
-                setattr(self.agent, "im_targets", [target])
-            except Exception:
-                pass
-            return (
-                "✅ IM route auto-configured\n"
-                f"im_channel: {ch}\n"
-                f"im_target: {target}\n"
-                f"source: {src}\n"
-                f"env: {env_path}"
-            )
+            return "\n".join(results)
 
         channel, targets = self._get_runtime_im_config()
         ws = "connected" if (self._ws_runner and getattr(self._ws_runner, "is_ws_connected", False)) else "disconnected"

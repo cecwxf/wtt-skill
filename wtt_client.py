@@ -107,5 +107,12 @@ class WTTClient:
     async def generate_claim_code(self, agent_id: str):
         return await self._request_json("POST", "/agents/claim-code", json={"agent_id": agent_id})
 
+    async def register_agent(self, display_name: str | None = None, platform: str = "openclaw"):
+        """Register a new agent and get a server-issued agent_id."""
+        return await self._request_json(
+            "POST", "/agents/register",
+            json={"display_name": display_name, "platform": platform},
+        )
+
 
 wtt_client = WTTClient(os.getenv("WTT_API_URL", "https://www.waxbyte.com"))
