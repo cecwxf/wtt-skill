@@ -367,7 +367,9 @@ echo "ℹ️  PY_BIN(selected): $PY_BIN"
 autostart_mac() {
   local plist="$HOME/Library/LaunchAgents/com.openclaw.wtt.autopoll.plist"
   local label="com.openclaw.wtt.autopoll"
-  local domain="gui/$(id -u)"
+  local uid
+  uid="$(id -u)"
+  local domains=("gui/$uid" "user/$uid")
   mkdir -p "$HOME/Library/LaunchAgents"
 
   cat > "$plist" <<PLIST
@@ -406,28 +408,46 @@ autostart_mac() {
 </plist>
 PLIST
 
-  launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
+  local d
+  for d in "${domains[@]}"; do
+    launchctl bootout "$d/$label" >/dev/null 2>&1 || true
+  done
 
-  # In non-GUI/session-limited contexts, bootstrap may fail with I/O error.
-  # Treat this as deferred install (plist written), not hard failure.
-  if launchctl bootstrap "$domain" "$plist" >/dev/null 2>&1; then
-    launchctl kickstart -k "$domain/$label" >/dev/null 2>&1 || true
-    echo "✅ macOS launchd service installed"
-    launchctl list | grep "$label" || true
-    return 0
-  fi
+  for d in "${domains[@]}"; do
+    if launchctl bootstrap "$d" "$plist" >/dev/null 2>&1; then
+      launchctl kickstart -k "$d/$label" >/dev/null 2>&1 || true
+      if launchctl print "$d/$label" 2>/dev/null | grep -q "state = running"; then
+        echo "✅ macOS launchd service installed"
+        launchctl list | grep "$label" || true
+        return 0
+      fi
+    fi
+  done
 
+  # If already loaded, try to force start.
   if launchctl list | grep -q "$label"; then
-    launchctl kickstart -k "$domain/$label" >/dev/null 2>&1 || true
-    echo "✅ macOS launchd service already loaded"
-    launchctl list | grep "$label" || true
+    for d in "${domains[@]}"; do
+      launchctl kickstart -k "$d/$label" >/dev/null 2>&1 || true
+      if launchctl print "$d/$label" 2>/dev/null | grep -q "state = running"; then
+        echo "✅ macOS launchd service already loaded and running"
+        launchctl list | grep "$label" || true
+        return 0
+      fi
+    done
+  fi
+
+  if [[ "${WTT_ALLOW_DEFERRED_LAUNCHD:-0}" == "1" ]]; then
+    echo "⚠️  launchd start deferred; plist written but service not running yet"
+    echo "   Plist: $plist"
+    echo "   Try: launchctl bootstrap gui/$uid $plist && launchctl kickstart -k gui/$uid/$label"
     return 0
   fi
 
-  echo "ℹ️  launchd bootstrap deferred (non-interactive/GUI context)."
-  echo "   Plist is ready: $plist"
-  echo "   Run in your macOS user session: launchctl bootstrap $domain $plist && launchctl kickstart -k $domain/$label"
-  return 0
+  echo "❌ Failed to start launchd service automatically"
+  echo "   Plist: $plist"
+  echo "   Tried domains: ${domains[*]}"
+  echo "   To allow deferred mode, set: WTT_ALLOW_DEFERRED_LAUNCHD=1"
+  return 1
 }
 
 autostart_linux() {
