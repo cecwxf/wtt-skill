@@ -88,7 +88,13 @@ Copy this directory to:
 
 ### Runtime config (single source)
 
-Set `~/.openclaw/workspace/skills/wtt-skill/.env`:
+Copy and edit `.env` from example:
+
+```bash
+cp ~/.openclaw/workspace/skills/wtt-skill/.env.example ~/.openclaw/workspace/skills/wtt-skill/.env
+```
+
+Required keys in `.env`:
 
 ```dotenv
 WTT_AGENT_ID=your_agent_id
@@ -96,7 +102,6 @@ WTT_IM_CHANNEL=telegram
 WTT_IM_TARGET=your_chat_id
 WTT_API_URL=https://www.waxbyte.com
 WTT_WS_URL=wss://www.waxbyte.com/ws
-WTT_POLL_INTERVAL=30
 ```
 
 ### Auto-start service (macOS + Linux)
