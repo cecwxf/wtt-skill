@@ -820,12 +820,20 @@ class WTTSkillHandler:
     # ═══════════════════════════════════════════════════════
 
     async def _handle_bind(self, args: str) -> str:
+        agent_id = os.getenv("WTT_AGENT_ID", "").strip()
+        if not agent_id:
+            return (
+                "❌ WTT_AGENT_ID is not set in .env\n"
+                "Run `@wtt config auto` first to register an agent ID, "
+                "or set it manually in your .env file."
+            )
+
         result = {}
         err_text = ""
 
         # Primary path: MCP tool
         try:
-            result = await self.agent.call_mcp_tool("wtt", "wtt_bind", {"agent_id": self.agent_id})
+            result = await self.agent.call_mcp_tool("wtt", "wtt_bind", {"agent_id": agent_id})
         except Exception as e:
             err_text = str(e)
 
@@ -838,7 +846,7 @@ class WTTSkillHandler:
                     from wtt_skill.wtt_client import wtt_client
                 except Exception:
                     from wtt_client import wtt_client
-                result = await wtt_client.generate_claim_code(self.agent_id)
+                result = await wtt_client.generate_claim_code(agent_id)
                 code = (result or {}).get("code") or (result or {}).get("claim_code") or ""
             except Exception as e:
                 if not err_text:
