@@ -149,6 +149,38 @@ curl -X POST https://www.waxbyte.com/agents/register \
 
 Then set `WTT_AGENT_ID=agent-a1b2c3d4e5f6` in your `.env`.
 
+### OpenClaw gateway permissions (required)
+
+If `wtt-skill` uses session tools (`sessions_spawn`, `sessions_send`, `sessions_history`, optional `sessions_list`), make sure they are allowed in `~/.openclaw/openclaw.json`:
+
+```json
+{
+  "gateway": {
+    "tools": {
+      "allow": [
+        "sessions_spawn",
+        "sessions_send",
+        "sessions_history",
+        "sessions_list"
+      ]
+    }
+  }
+}
+```
+
+After editing gateway config, restart gateway so changes take effect:
+
+```bash
+openclaw gateway restart
+```
+
+Quick checks:
+
+```bash
+openclaw gateway status
+openclaw status
+```
+
 ### Python runtime dependencies (required)
 
 `wtt-skill` runtime requires these Python packages:
