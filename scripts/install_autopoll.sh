@@ -3,7 +3,8 @@ set -euo pipefail
 
 SCRIPT_PATH="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+SKILLS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # Fixed install location: ~/.openclaw/workspace/skills/wtt-skill
 SKILL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -17,9 +18,12 @@ fi
 WORKDIR="$SKILL_ROOT"
 PY_BIN="${PY_BIN:-}"
 if [[ -z "$PY_BIN" ]]; then
-  if [[ -x "$REPO_ROOT/.venv311/bin/python" ]]; then
-    PY_BIN="$REPO_ROOT/.venv311/bin/python"
-    WORKDIR="$REPO_ROOT"
+  if [[ -x "$WORKSPACE_ROOT/.venv311/bin/python" ]]; then
+    PY_BIN="$WORKSPACE_ROOT/.venv311/bin/python"
+    WORKDIR="$WORKSPACE_ROOT"
+  elif [[ -x "$SKILLS_ROOT/.venv311/bin/python" ]]; then
+    PY_BIN="$SKILLS_ROOT/.venv311/bin/python"
+    WORKDIR="$SKILLS_ROOT"
   elif command -v python3.11 >/dev/null 2>&1; then
     PY_BIN="$(command -v python3.11)"
   else
@@ -81,7 +85,9 @@ PY
   fi
 
   local pip_args=("--disable-pip-version-check")
-  if [[ -z "${VIRTUAL_ENV:-}" ]] && [[ "$PY_BIN" != "$REPO_ROOT/.venv311/bin/python" ]]; then
+  if [[ -z "${VIRTUAL_ENV:-}" ]] \
+     && [[ "$PY_BIN" != "$WORKSPACE_ROOT/.venv311/bin/python" ]] \
+     && [[ "$PY_BIN" != "$SKILLS_ROOT/.venv311/bin/python" ]]; then
     pip_args+=("--user")
   fi
 
@@ -140,7 +146,8 @@ EOF
   echo "✅ Checked required .env keys: $ENV_FILE"
 }
 
-echo "ℹ️  REPO_ROOT:    $REPO_ROOT"
+echo "ℹ️  WORKSPACE_ROOT:$WORKSPACE_ROOT"
+echo "ℹ️  SKILLS_ROOT:  $SKILLS_ROOT"
 echo "ℹ️  SKILL_ROOT:   $SKILL_ROOT"
 echo "ℹ️  WORKDIR:      $WORKDIR"
 echo "ℹ️  START_SCRIPT: $START_SCRIPT"
