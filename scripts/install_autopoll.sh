@@ -436,6 +436,19 @@ PLIST
     done
   fi
 
+  if pgrep -f "$SKILL_ROOT/start_wtt_autopoll.py" >/dev/null 2>&1; then
+    echo "✅ autopoll process already running (non-launchd fallback)"
+    return 0
+  fi
+
+  echo "⚠️  launchd not available in current context, trying direct background fallback..."
+  nohup "$WRAPPER_SCRIPT" >/tmp/wtt_autopoll.log 2>/tmp/wtt_autopoll_error.log &
+  sleep 1
+  if pgrep -f "$SKILL_ROOT/start_wtt_autopoll.py" >/dev/null 2>&1; then
+    echo "✅ autopoll started via direct background fallback"
+    return 0
+  fi
+
   if [[ "${WTT_ALLOW_DEFERRED_LAUNCHD:-0}" == "1" ]]; then
     echo "⚠️  launchd start deferred; plist written but service not running yet"
     echo "   Plist: $plist"
@@ -443,10 +456,10 @@ PLIST
     return 0
   fi
 
-  echo "❌ Failed to start launchd service automatically"
+  echo "❌ Failed to start autopoll automatically"
   echo "   Plist: $plist"
   echo "   Tried domains: ${domains[*]}"
-  echo "   To allow deferred mode, set: WTT_ALLOW_DEFERRED_LAUNCHD=1"
+  echo "   Direct fallback also failed"
   return 1
 }
 
