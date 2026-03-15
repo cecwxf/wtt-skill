@@ -20,6 +20,8 @@ if [[ -z "$PY_BIN" ]]; then
   if [[ -x "$REPO_ROOT/.venv311/bin/python" ]]; then
     PY_BIN="$REPO_ROOT/.venv311/bin/python"
     WORKDIR="$REPO_ROOT"
+  elif command -v python3.11 >/dev/null 2>&1; then
+    PY_BIN="$(command -v python3.11)"
   else
     PY_BIN="$(command -v python3 || true)"
   fi
@@ -55,13 +57,13 @@ ensure_python_deps() {
   local missing
   missing="$($PY_BIN - <<'PY'
 import importlib.util
-mods = ["httpx", "websockets"]
+mods = ["httpx", "websockets", "socksio"]
 print(" ".join([m for m in mods if importlib.util.find_spec(m) is None]))
 PY
 )"
 
   if [[ -z "${missing// }" ]]; then
-    echo "✅ Python runtime deps already present (httpx, websockets)"
+    echo "✅ Python runtime deps already present (httpx, websockets, socksio)"
     return 0
   fi
 
@@ -71,7 +73,7 @@ PY
   fi
 
   echo "ℹ️  Installing python deps for wtt-skill: $missing"
-  "$PY_BIN" -m pip install "${pip_args[@]}" "httpx>=0.24" "websockets>=11"
+  "$PY_BIN" -m pip install "${pip_args[@]}" "httpx[socks]>=0.24" "websockets>=11" "socksio>=1.0.0"
   echo "✅ Python deps installed"
 }
 
@@ -128,6 +130,15 @@ echo "ℹ️  WORKDIR:      $WORKDIR"
 echo "ℹ️  START_SCRIPT: $START_SCRIPT"
 echo "ℹ️  PY_BIN:       $PY_BIN"
 
+USER_SITE="$($PY_BIN - <<'PY'
+import site
+try:
+    print(site.getusersitepackages())
+except Exception:
+    print("")
+PY
+)"
+
 autostart_mac() {
   local plist="$HOME/Library/LaunchAgents/com.openclaw.wtt.autopoll.plist"
   mkdir -p "$HOME/Library/LaunchAgents"
@@ -157,6 +168,10 @@ autostart_mac() {
       <string>$SERVICE_PATH</string>
       <key>OPENCLAW_BIN</key>
       <string>$OPENCLAW_BIN</string>
+      <key>HOME</key>
+      <string>$HOME</string>
+      <key>PYTHONPATH</key>
+      <string>$USER_SITE</string>
     </dict>
 
     <key>StandardOutPath</key>
@@ -192,6 +207,8 @@ Restart=always
 RestartSec=2
 Environment="PATH=$SERVICE_PATH"
 Environment="OPENCLAW_BIN=$OPENCLAW_BIN"
+Environment="HOME=$HOME"
+Environment="PYTHONPATH=$USER_SITE"
 WorkingDirectory=$WORKDIR
 StandardOutput=append:/tmp/wtt_autopoll.log
 StandardError=append:/tmp/wtt_autopoll_error.log

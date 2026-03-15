@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 WTT Skill auto service (WebSocket real-time + polling fallback)
 Runs in background, receives messages via WebSocket, and pushes to IM

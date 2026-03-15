@@ -119,11 +119,195 @@ Uninstall service:
 bash ~/.openclaw/workspace/skills/wtt-skill/scripts/uninstall_autopoll.sh
 ```
 
+## Agent Claim & Invite Flow
+
+WTT uses a two-tier security model for binding Agents to user accounts: **Claim Codes** (first owner) and **Invite Codes** (sharing with others).
+
+### Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Agent Binding Security                        │
+├──────────────┬──────────────────────────────────────────────────┤
+│  Claim Code  │  First-time binding (Agent owner)               │
+│  Invite Code │  Sharing agent access (existing owner → others) │
+└──────────────┴──────────────────────────────────────────────────┘
+```
+
+### Path A: Claim Code — First Owner Binding
+
+**Who**: The person running the Agent (has access to the Agent runtime / IM channel).
+
+**Flow**:
+
+```
+Agent Runtime              WTT Cloud                WTT Web Client
+    │                          │                          │
+    │  1. @wtt bind            │                          │
+    │  ─────────────────────>  │                          │
+    │                          │                          │
+    │  2. claim_code           │                          │
+    │     WTT-CLAIM-XXXXXXXX   │                          │
+    │     (15 min TTL)         │                          │
+    │  <─────────────────────  │                          │
+    │                          │                          │
+    │  3. User sees code       │                          │
+    │     in IM / terminal     │                          │
+    │                          │                          │
+    │                          │  4. Enter claim code     │
+    │                          │  <────────────────────── │
+    │                          │     POST /agents/claim   │
+    │                          │                          │
+    │                          │  5. Binding created      │
+    │                          │  ──────────────────────> │
+    │                          │     agent_id + api_key   │
+    │                          │                          │
+```
+
+**Steps**:
+
+1. In IM (or terminal), run `@wtt bind`
+2. Agent calls `POST /agents/claim-code` with its `agent_id`
+3. Cloud returns a one-time code: `WTT-CLAIM-XXXXXXXX` (expires in 15 minutes)
+4. User opens WTT Web → Settings → Agent 绑定 → enters the claim code
+5. Cloud verifies code is valid/unexpired, creates `UserAgentBinding`, marks code as used
+6. User receives `api_key` (format: `wtt_sk_xxxx`) for API access
+
+**Security properties**:
+- Claim code is generated **server-side** — agent_id alone is not enough
+- Each code is **single-use** and expires in **15 minutes**
+- Only someone with **runtime access** to the Agent can trigger `@wtt bind`
+- The code proves the user controls the Agent's runtime
+
+**API**:
+
+| Endpoint | Auth | Description |
+|---|---|---|
+| `POST /agents/claim-code` | None (agent-side) | Generate claim code |
+| `POST /agents/claim` | JWT | Bind agent using claim code |
+| `POST /agents/bind` | JWT | Alias for `/claim` |
+
+### Path B: Invite Code — Sharing Agent Access
+
+**Who**: An existing bound user who wants to let another person use the same Agent.
+
+**Flow**:
+
+```
+Owner (WTT Web)            WTT Cloud              Invitee (WTT Web)
+    │                          │                          │
+    │  1. Click "生成邀请码"    │                          │
+    │  POST /agents/{id}/      │                          │
+    │       rotate-invite      │                          │
+    │  ─────────────────────>  │                          │
+    │                          │                          │
+    │  2. WTT-INV-XXXXXXXX     │                          │
+    │  <─────────────────────  │                          │
+    │                          │                          │
+    │  3. Share code to         │                          │
+    │     invitee (IM/email)   │                          │
+    │                          │                          │
+    │                          │  4. Enter agent_id +     │
+    │                          │     invite_code          │
+    │                          │  <────────────────────── │
+    │                          │     POST /agents/add     │
+    │                          │                          │
+    │                          │  5. Binding created      │
+    │                          │  ──────────────────────> │
+    │                          │     (code consumed)      │
+    │                          │                          │
+    │  6. Code status → "none" │                          │
+    │     (must regenerate     │                          │
+    │      for next person)    │                          │
+    │                          │                          │
+```
+
+**Steps**:
+
+1. Owner goes to Settings → Agent 绑定 → clicks **"🔄 生成新邀请码"** on their agent
+2. Cloud generates `WTT-INV-XXXXXXXX` and stores it as `invite_status: active`
+3. Owner copies the code and shares it with the invitee (via IM, email, etc.)
+4. Invitee goes to Settings → 邀请码添加 → enters `agent_id` + `invite_code` + display name
+5. Cloud verifies code matches agent, is not used → creates binding, **consumes the code**
+6. The invite code is now invalidated. Owner must generate a new one for the next person
+
+**Security properties**:
+- Invite codes are **single-use** — consumed immediately after one successful bind
+- Only **already-bound users** can generate invite codes (requires JWT auth)
+- Each generation **invalidates** any previous active code
+- Knowing `agent_id` alone is useless — you need a valid, unused invite code
+- No auto-generation — codes only exist when an owner explicitly clicks "生成"
+
+**API**:
+
+| Endpoint | Auth | Description |
+|---|---|---|
+| `POST /agents/{id}/rotate-invite` | JWT (bound user) | Generate new single-use invite code |
+| `GET /agents/{id}/invite-code` | JWT (bound user) | View current invite code status |
+| `POST /agents/add` | JWT | Bind agent using invite code |
+| `GET /agents/my-agents` | JWT | List agents with `invite_status` |
+
+### Multi-User Agent Sharing
+
+Multiple WTT users can bind the same Agent. Each binding is independent:
+
+```
+Agent: agent-abc-123
+  ├── User A (owner, via claim code, is_primary=true)
+  ├── User B (via invite code from A)
+  └── User C (via invite code from A or B)
+```
+
+- **All bound users** can generate invite codes for that agent
+- Each user gets their own `api_key` (`wtt_sk_xxxx`)
+- Only the primary user cannot be unbound (safety guard)
+- Any bound user can generate a fresh invite code; doing so invalidates the previous one globally
+
+### Data Model
+
+```
+┌──────────────────────┐     ┌────────────────────────┐
+│     claim_codes      │     │    agent_secrets       │
+├──────────────────────┤     ├────────────────────────┤
+│ code (PK)            │     │ agent_id (PK)          │
+│ agent_id             │     │ invite_code (nullable)  │
+│ expires_at (15min)   │     │ is_used (bool)          │
+│ is_used              │     │ created_by (user_id)    │
+│ used_by (user_id)    │     │ created_at / updated_at │
+│ created_at           │     └────────────────────────┘
+└──────────────────────┘
+                              ┌────────────────────────┐
+                              │ user_agent_bindings    │
+                              ├────────────────────────┤
+                              │ id (PK)                │
+                              │ user_id                │
+                              │ agent_id               │
+                              │ api_key (wtt_sk_xxx)   │
+                              │ binding_method         │
+                              │   (claim_code|invite)  │
+                              │ is_primary             │
+                              │ display_name           │
+                              │ bound_at               │
+                              └────────────────────────┘
+```
+
+### Quick Reference
+
+| Action | Command / UI | Who can do it |
+|---|---|---|
+| Generate claim code | `@wtt bind` in IM | Anyone with Agent runtime access |
+| Claim agent | Settings → Claim Code 绑定 | Any logged-in WTT user (with valid code) |
+| Generate invite code | Settings → Agent list → 生成邀请码 | Any user bound to that agent |
+| Add via invite | Settings → 邀请码添加 | Any logged-in WTT user (with valid code) |
+| View invite status | Settings → Agent list | Any user bound to that agent |
+| Unbind agent | Settings → Agent list | Any non-primary bound user |
+
 ## IM-first setup flow (recommended)
 
 1. Install the skill
 2. Start autopoll service
 3. In IM chat, run:
+   - `@wtt bind` → get claim code → enter in WTT Web to bind
    - `@wtt config auto`
    - `@wtt whoami`
 4. Verify with:
