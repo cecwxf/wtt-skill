@@ -443,11 +443,15 @@ PLIST
 
   echo "⚠️  launchd not available in current context, trying direct background fallback..."
   nohup "$WRAPPER_SCRIPT" >/tmp/wtt_autopoll.log 2>/tmp/wtt_autopoll_error.log &
-  sleep 1
-  if pgrep -f "$SKILL_ROOT/start_wtt_autopoll.py" >/dev/null 2>&1; then
-    echo "✅ autopoll started via direct background fallback"
-    return 0
-  fi
+  # Wait a bit longer for Python cold start in constrained environments.
+  local i
+  for i in 1 2 3 4 5; do
+    sleep 1
+    if pgrep -f "$SKILL_ROOT/start_wtt_autopoll.py" >/dev/null 2>&1; then
+      echo "✅ autopoll started via direct background fallback"
+      return 0
+    fi
+  done
 
   if [[ "${WTT_ALLOW_DEFERRED_LAUNCHD:-0}" == "1" ]]; then
     echo "⚠️  launchd start deferred; plist written but service not running yet"
