@@ -138,10 +138,14 @@ class OpenClawAgent:
         self._load_config()
         self.processed_message_ids = set()
         self.active_task_runs = set()
+        self.max_concurrent_tasks = int(os.getenv("WTT_MAX_CONCURRENT_TASKS", "4"))
+        self._task_semaphore = asyncio.Semaphore(self.max_concurrent_tasks)
+        self._task_queue: list[str] = []  # task keys waiting for a slot
         self.reject_rerun_cooldown_sec = int(os.getenv("WTT_REJECT_RERUN_COOLDOWN", "120"))
         # Hard rule: report progress at least every 60 seconds while running
         self.task_progress_interval_sec = 60
-        self.task_max_runtime_sec = int(os.getenv("WTT_TASK_MAX_RUNTIME", "1800"))
+        self.task_max_runtime_sec = int(os.getenv("WTT_TASK_MAX_RUNTIME", "600"))
+        self.task_stale_timeout_sec = int(os.getenv("WTT_TASK_STALE_TIMEOUT", "300"))
         self.last_reject_rerun_ts = {}
         self.pending_reject_rerun = {}
         self.pending_task_input_queue = {}
@@ -455,93 +459,28 @@ class OpenClawAgent:
                         self.topic_session_keys.pop(topic_id, None)
                         raise RuntimeError("sessions_send failed, will retry with new session")
                 else:
-                    # 新建独立 session（无 runtime=subagent，不挂载到 main session )
+                    # 新建独立 session — delegate to _spawn_session_and_poll (polls main session for push result)
                     label = f"wtt-topic-{(topic_id or 'adhoc')[:12]}"
-                    child = None
-                    try:
-                        spawn = await self._invoke_tool(
-                            "sessions_spawn",
-                            {
-                                "task": text,
-                                "label": label,
-                                "mode": "run",
-                                "cleanup": "keep",
-                                "runTimeoutSeconds": max(120, int(self.task_max_runtime_sec)),
-                                "timeoutSeconds": 30,
-                            },
-                        )
-                        child = (spawn or {}).get("childSessionKey")
-                    except Exception as e:
-                        if "label already in use" in str(e) or "already in use" in str(e):
-                            child = await self._find_session_by_label(label)
-                        if not child:
-                            raise
-
-                    if not child:
-                        raise RuntimeError("sessions_spawn missing childSessionKey")
-                    # 缓存 session key 以便后续复用
-                    if topic_id:
+                    child, result = await self._spawn_session_and_poll(text, label=label)
+                    if child and topic_id:
                         self.topic_session_keys[topic_id] = child
-
-                # 轮询 sessions_history 获取结果
-                deadline = time.time() + max(45, min(180, int(self.task_max_runtime_sec)))
-                poll_interval = 1.0
-                prev_msg_count = 0
-                while time.time() < deadline:
-                    hist = await self._invoke_tool("sessions_history", {"sessionKey": child, "limit": 30, "includeTools": False})
-                    err = self._extract_assistant_error(hist)
-                    if err:
-                        raise RuntimeError(err)
-                    texts = self._extract_assistant_texts(hist)
-
-                    # Progress reporting
-                    if topic_id:
-                        elapsed = max(0, int(time.time()) - started_at)
-                        if elapsed >= self.task_progress_interval_sec:
-                            report_no = elapsed // self.task_progress_interval_sec
-                            if report_no > last_minute_report:
-                                last_minute_report = report_no
-                                minute = max(1, elapsed // 60)
-                                progress_pct = min(95, max(20, minute * 20))
-                                ts = time.strftime('%H:%M:%S')
-                                try:
-                                    await asyncio.wait_for(
-                                        self._safe_publish(
-                                            topic_id,
-                                            f"Time: {ts}\n"
-                                            f"Progress: {progress_pct}%\n"
-                                            f"Status: [Task: {title or 'general chat'}] reasoning in progress(running {minute} min )"
-                                        ),
-                                        timeout=15,
-                                    )
-                                except asyncio.TimeoutError:
-                                    pass
-
-                    # 对于 send 模式，只取最新的 assistant 回复（跳过旧的 )
-                    if texts and len(texts) > prev_msg_count:
-                        result = texts[-1].strip()
-                        if result and result.upper() != "READY":
-                            if topic_id:
-                                ts = time.strftime('%H:%M:%S')
-                                try:
-                                    await asyncio.wait_for(
-                                        self._safe_publish(
-                                            topic_id,
-                                            f"Time: {ts}\n"
-                                            f"Progress: 100%\n"
-                                            f"Status: [Task: {title or 'general chat'}] reasoning completed"
-                                        ),
-                                        timeout=15,
-                                    )
-                                except asyncio.TimeoutError:
-                                    pass
-                            return result
-
-                    prev_msg_count = len(texts) if texts else prev_msg_count
-                    await asyncio.sleep(poll_interval)
-                    poll_interval = min(poll_interval * 1.3, 3.0)
-
-                raise RuntimeError("session infer timeout: no assistant text returned")
+                    if result and result.upper() != "READY":
+                        if topic_id:
+                            ts = time.strftime('%H:%M:%S')
+                            try:
+                                await asyncio.wait_for(
+                                    self._safe_publish(
+                                        topic_id,
+                                        f"Time: {ts}\n"
+                                        f"Progress: 100%\n"
+                                        f"Status: [Task: {title or 'general chat'}] reasoning completed"
+                                    ),
+                                    timeout=15,
+                                )
+                            except asyncio.TimeoutError:
+                                pass
+                        return result
+                    raise RuntimeError("session infer timeout: no assistant text returned")
             except Exception as e:
                 last_err = e
                 cached_key = None  # 重试时强制新建 session
@@ -760,9 +699,9 @@ class OpenClawAgent:
         return ""
 
     async def _spawn_session_and_poll(self, prompt: str, label: str = "", context: str = "") -> tuple[Optional[str], Optional[str]]:
-        """创建独立 session（非 subagent )，执行 prompt 并轮询结果。
+        """创建 subagent session 并通过轮询主 session 获取结果。
+        Gateway 使用 auto-announce push 模式：子 session 完成后结果推送到 agent:main:main。
         返回 (sessionKey, assistant_text)。sessionKey 可缓存复用。
-        context: optional prior conversation context to inject into the new session.
         """
         spawn_label = label or "wtt-task"
         child = None
@@ -774,18 +713,24 @@ class OpenClawAgent:
             "runTimeoutSeconds": max(120, int(self.task_max_runtime_sec)),
             "timeoutSeconds": 30,
         }
-        # Pass context to OpenClaw if available (native session context injection)
         if context:
             spawn_params["context"] = context
+
+        # Record main session message count BEFORE spawning
+        pre_main_count = 0
+        try:
+            pre_hist = await self._invoke_tool("sessions_history", {"sessionKey": "agent:main:main", "limit": 100, "includeTools": False})
+            pre_main_count = len((pre_hist or {}).get("messages", []) or [])
+        except Exception:
+            pass
+
         try:
             spawn = await self._invoke_tool("sessions_spawn", spawn_params)
             child = (spawn or {}).get("childSessionKey")
         except Exception as e:
             if "label already in use" in str(e) or "already in use" in str(e):
-                # Try to reuse existing session by label
                 child = await self._find_session_by_label(spawn_label)
                 if child and not await self._check_session_alive(child):
-                    # Old session is dead, retry with unique label suffix
                     child = None
                     unique_label = f"{spawn_label}-{int(time.time()) % 100000}"
                     spawn_params["label"] = unique_label
@@ -800,20 +745,108 @@ class OpenClawAgent:
         if not child:
             raise RuntimeError("sessions_spawn missing childSessionKey")
 
-        deadline = time.time() + max(150, int(self.task_max_runtime_sec) + 60)
-        poll_interval = 1.0
-        while time.time() < deadline:
-            hist = await self._invoke_tool("sessions_history", {"sessionKey": child, "limit": 40, "includeTools": False})
-            err = self._extract_assistant_error(hist)
-            if err:
-                raise RuntimeError(err)
-            texts = self._extract_assistant_texts(hist)
-            if texts:
-                return child, texts[-1].strip()
-            await asyncio.sleep(poll_interval)
-            poll_interval = min(poll_interval * 1.3, 3.0)
+        # Extract suffix for matching in completion events (gateway abbreviates keys)
+        child_suffix = child.rsplit(":", 1)[-1][-4:] if child else ""
+        print(f"🔍 [spawn] child={child[:35]} suffix={child_suffix} label={spawn_label}")
 
+        deadline = time.time() + max(150, int(self.task_max_runtime_sec) + 60)
+        poll_interval = 3.0
+        poll_count = 0
+        while time.time() < deadline:
+            try:
+                hist = await self._invoke_tool("sessions_history", {
+                    "sessionKey": "agent:main:main",
+                    "limit": max(50, pre_main_count + 20),
+                    "includeTools": False,
+                })
+            except Exception as poll_err:
+                print(f"⚠️ [spawn_poll] main history error: {poll_err}")
+                await asyncio.sleep(poll_interval)
+                continue
+
+            msgs = (hist or {}).get("messages", []) or []
+            poll_count += 1
+
+            # Scan for completion event matching our child session
+            for i, m in enumerate(msgs):
+                if m.get("role") != "user":
+                    continue
+                text_parts = []
+                for c in (m.get("content") or []):
+                    if isinstance(c, dict) and c.get("text"):
+                        text_parts.append(str(c["text"]))
+                full_text = "\n".join(text_parts)
+
+                if "[Internal task completion event]" not in full_text:
+                    continue
+                if child_suffix not in full_text:
+                    continue
+
+                # Found our completion event
+                print(f"🔍 [spawn_poll] Found completion event for {child_suffix} at msg[{i}] poll#{poll_count}")
+
+                # Extract result from <<<BEGIN_UNTRUSTED_CHILD_RESULT>>> markers
+                result_text = self._extract_child_result(full_text)
+
+                # Check status
+                if "status: failed" in full_text or "status: error" in full_text:
+                    # Extract error details
+                    for line in full_text.splitlines():
+                        if line.strip().startswith("status:"):
+                            err_detail = line.strip()
+                            break
+                    else:
+                        err_detail = "unknown error"
+                    # If there's a result despite failure, return it
+                    if result_text and result_text != "(no output)":
+                        return child, result_text
+                    # Otherwise check if the assistant response after this event has useful text
+                    if i + 1 < len(msgs) and msgs[i + 1].get("role") == "assistant":
+                        asst_text = self._extract_text_from_message(msgs[i + 1])
+                        if asst_text:
+                            return child, asst_text
+                    raise RuntimeError(f"subagent task failed: {err_detail}")
+
+                # Success: return extracted result
+                if result_text and result_text != "(no output)":
+                    return child, result_text
+                # Fallback: use assistant response after completion event
+                if i + 1 < len(msgs) and msgs[i + 1].get("role") == "assistant":
+                    asst_text = self._extract_text_from_message(msgs[i + 1])
+                    if asst_text:
+                        return child, asst_text
+                # Got event but no result yet (might still be processing)
+                break
+
+            if poll_count % 5 == 0:
+                elapsed = int(time.time() - (deadline - max(150, int(self.task_max_runtime_sec) + 60)))
+                print(f"🔍 [spawn_poll] Waiting for {child_suffix} poll#{poll_count} elapsed={elapsed}s main_msgs={len(msgs)}")
+
+            await asyncio.sleep(poll_interval)
+            poll_interval = min(poll_interval * 1.2, 8.0)
+
+        print(f"⚠️ [spawn_poll] Timeout waiting for completion of {child[:30]}")
         return child, None
+
+    @staticmethod
+    def _extract_child_result(event_text: str) -> str:
+        """Extract result text from between <<<BEGIN_UNTRUSTED_CHILD_RESULT>>> markers."""
+        begin = "<<<BEGIN_UNTRUSTED_CHILD_RESULT>>>"
+        end = "<<<END_UNTRUSTED_CHILD_RESULT>>>"
+        idx_start = event_text.find(begin)
+        idx_end = event_text.find(end)
+        if idx_start >= 0 and idx_end > idx_start:
+            return event_text[idx_start + len(begin):idx_end].strip()
+        return ""
+
+    @staticmethod
+    def _extract_text_from_message(msg: dict) -> str:
+        """Extract concatenated text from a message's content array."""
+        parts = []
+        for c in (msg.get("content") or []):
+            if isinstance(c, dict) and c.get("text"):
+                parts.append(str(c["text"]).strip())
+        return "\n".join(parts)
 
     async def _check_session_alive(self, session_key: str) -> bool:
         """Check if a session is still alive. Uses sessions_history first,
@@ -890,7 +923,7 @@ class OpenClawAgent:
                 return texts[-1].strip()
             # Check if session is processing (messages count changed or status hints)
             await asyncio.sleep(poll_interval)
-            poll_interval = min(poll_interval * 1.3, 3.0)
+            poll_interval = min(poll_interval * 1.3, 5.0)
 
         # Phase 2: extended wait (session is likely still working, just slow)
         deadline = time.time() + max(90, int(self.task_max_runtime_sec) - 30)
@@ -1083,6 +1116,70 @@ class OpenClawAgent:
                 print(f"⚠️ Failed to set task status task_id={task_id} status={status} code={resp.status_code} body={resp.text[:200]}")
         except Exception as e:
             print(f"⚠️ Task status update exception task_id={task_id} status={status}: {e}")
+
+    async def recover_zombie_doing_tasks(self):
+        """On startup, reset any 'doing' tasks owned by this agent back to 'todo',
+        then also pick up all 'todo' tasks and re-trigger them."""
+        recovered = []
+        try:
+            # Phase 1: reset doing → todo
+            resp = await wtt_client.client.get(
+                f"{wtt_client.api_url}/tasks",
+                params={"status": "doing", "limit": 100},
+                timeout=15,
+            )
+            if resp.status_code < 400:
+                tasks = resp.json() if hasattr(resp, "json") else []
+                for t in (tasks or []):
+                    owner = str(t.get("runner_agent_id") or t.get("owner_agent_id") or "")
+                    if owner != self.agent_id:
+                        continue
+                    task_id = str(t.get("id") or "")
+                    title = str(t.get("title") or "?")[:30]
+                    topic_id = str(t.get("topic_id") or "")
+                    if not task_id:
+                        continue
+                    await self._set_task_status(task_id, "todo")
+                    recovered.append((task_id, topic_id, title))
+                    print(f"♻️  Reset zombie doing task → todo: {title} ({task_id[:12]})")
+                if recovered:
+                    print(f"♻️  Recovered {len(recovered)} zombie doing tasks on startup")
+
+            # Phase 2: collect all todo tasks and auto-retrigger
+            resp2 = await wtt_client.client.get(
+                f"{wtt_client.api_url}/tasks",
+                params={"status": "todo", "limit": 50},
+                timeout=15,
+            )
+            if resp2.status_code < 400:
+                todo_tasks = resp2.json() if hasattr(resp2, "json") else []
+                retrigger = []
+                for t in (todo_tasks or []):
+                    owner = str(t.get("runner_agent_id") or t.get("owner_agent_id") or "")
+                    if owner != self.agent_id:
+                        continue
+                    task_id = str(t.get("id") or "")
+                    topic_id = str(t.get("topic_id") or "")
+                    title = str(t.get("title") or "?")[:30]
+                    desc = str(t.get("description") or "")
+                    exec_mode = str(t.get("exec_mode") or "reasoning")
+                    task_type = str(t.get("type") or "feature")
+                    if not task_id or not topic_id:
+                        continue
+                    retrigger.append((task_id, topic_id, title, desc, exec_mode, task_type))
+
+                if retrigger:
+                    print(f"🔄 Auto-retriggering {len(retrigger)} todo tasks on startup")
+                    for task_id, topic_id, title, desc, exec_mode, task_type in retrigger:
+                        print(f"  🚀 Retriggering: {title} ({task_id[:12]})")
+                        asyncio.create_task(
+                            self._execute_task_run(
+                                topic_id, task_id, exec_mode, task_type, title, desc
+                            )
+                        )
+                        await asyncio.sleep(0.3)
+        except Exception as e:
+            print(f"⚠️ recover_zombie_doing_tasks error: {e}")
 
     async def _set_task_notes(self, task_id: str, notes: str):
         try:
@@ -1297,6 +1394,28 @@ class OpenClawAgent:
                         f"Status: [Task: {title}] reasoning running(running {minute} min )"
                     )
 
+                    # Stale detection: force-reset tasks stuck too long
+                    first_seen = float(self._task_watch_first_seen.get(task_id, now_mono))
+                    age = now_mono - first_seen
+                    if age > self.task_stale_timeout_sec:
+                        print(f"💀 Task {task_id[:12]} ({title}) stuck for {int(age)}s > {self.task_stale_timeout_sec}s, force reset")
+                        try:
+                            await self._set_task_status(task_id, "todo")
+                            await self._safe_publish(
+                                topic_id,
+                                f"Time: {ts}\nProgress: 0%\n"
+                                f"Status: [Task: {title}] Timed out after {minute} min, will retry"
+                            )
+                            key_to_remove = None
+                            for k in list(self.active_task_runs):
+                                if task_id in k:
+                                    key_to_remove = k
+                                    break
+                            if key_to_remove:
+                                self.active_task_runs.discard(key_to_remove)
+                        except Exception as reset_err:
+                            print(f"⚠️ Failed to reset stale task {task_id[:12]}: {reset_err}")
+
                 # Cleanup tracker for tasks no longer in doing
                 stale = [tid for tid in self._task_watch_first_seen.keys() if tid not in active_ids]
                 for tid in stale:
@@ -1317,6 +1436,31 @@ class OpenClawAgent:
         if key in self.active_task_runs:
             return
         self.active_task_runs.add(key)
+        self._task_recent_touch[task_id] = time.time()
+
+        # Concurrency gate: wait for a slot before spawning gateway sessions
+        acquired = self._task_semaphore.locked()
+        if acquired:
+            queue_pos = len(self._task_queue) + 1
+            self._task_queue.append(key)
+            print(f"⏳ Task {task_id} queued (position {queue_pos}, max concurrent={self.max_concurrent_tasks})")
+            await self._safe_publish(
+                topic_id,
+                f"Time: {time.strftime('%H:%M:%S')}\n"
+                f"Progress: 0%\n"
+                f"Status: [Task: {title or 'untitled task'}] Queued (position {queue_pos})"
+            )
+
+        try:
+            async with self._task_semaphore:
+                if key in self._task_queue:
+                    self._task_queue.remove(key)
+                print(f"🚀 Task {task_id} acquired slot (active={len(self.active_task_runs)}, max={self.max_concurrent_tasks})")
+                await self._execute_task_run_inner(topic_id, task_id, exec_mode, task_type, title, description, extra_note)
+        finally:
+            self.active_task_runs.discard(key)
+
+    async def _execute_task_run_inner(self, topic_id: str, task_id: str, exec_mode: str = "reasoning", task_type: str = "feature", title: str = "", description: str = "", extra_note: str = ""):
         self._task_recent_touch[task_id] = time.time()
         try:
             # Mark task as 'doing' immediately on start
@@ -1448,9 +1592,8 @@ class OpenClawAgent:
         except Exception as e:
             print(f"❌ TASK_RUN execution failed task_id={task_id}: {e}")
         finally:
-            self.active_task_runs.discard(key)
-
             # reject 重跑优先
+            key = f"{topic_id}:{task_id}"
             queued = self.pending_reject_rerun.pop(key, None)
             if queued:
                 q_topic = queued.get("topic_id") or topic_id
@@ -1788,6 +1931,7 @@ async def main():
     runner = WTTSkillRunner(agent, interval=interval, mode=mode, ws_url=ws_url)
     agent._ws_runner = runner  # wire up WS runner for publish-over-WS
     await runner.start()
+    await agent.recover_zombie_doing_tasks()
     watchdog_task = asyncio.create_task(agent.task_progress_watchdog())
 
     print("\n" + "="*80, flush=True)
