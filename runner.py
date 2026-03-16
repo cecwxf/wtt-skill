@@ -256,6 +256,10 @@ class WTTSkillRunner:
             print(f"[WS DEBUG] Handling new_message", flush=True)
             asyncio.create_task(self._handle_ws_message(data))
 
+        # Task status change — trigger execution of new todo tasks
+        if msg_type == "task_status":
+            asyncio.create_task(self._handle_task_status_event(data))
+
     async def _refresh_subscribed_topics(self):
         """Fetch and cache subscribed topics (for task detection)."""
         try:
@@ -276,6 +280,34 @@ class WTTSkillRunner:
                 break
             except Exception:
                 break
+
+    async def _handle_task_status_event(self, data: dict):
+        """Handle task_status WS events — auto-execute new todo tasks on subscribed topics."""
+        try:
+            # Payload can be flat (task_id, status, topic_id) or nested under "task"
+            task = data.get("task") or data.get("data") or {}
+            status = str(task.get("status") or data.get("status") or "").lower()
+            if status != "todo":
+                return
+            task_id = str(task.get("id") or task.get("task_id") or data.get("task_id") or "")
+            topic_id = str(task.get("topic_id") or data.get("topic_id") or "")
+            title = str(task.get("title") or data.get("title") or "")
+            description = str(task.get("description") or data.get("description") or "")
+            exec_mode = str(task.get("exec_mode") or data.get("exec_mode") or "reasoning")
+            task_type = str(task.get("type") or task.get("task_type") or data.get("task_type") or "feature")
+            if not task_id or not topic_id:
+                return
+            # Only handle tasks on topics we're subscribed to
+            if topic_id not in self._subscribed_topics:
+                return
+            print(f"📋 [WS] New todo task: {title[:30]} ({task_id[:12]})")
+            if hasattr(self.agent, '_execute_task_run'):
+                import asyncio
+                asyncio.create_task(
+                    self.agent._execute_task_run(topic_id, task_id, exec_mode, task_type, title, description)
+                )
+        except Exception as e:
+            print(f"⚠️ _handle_task_status_event error: {e}")
 
     async def _handle_ws_message(self, data: dict):
         """Handle pushed WebSocket messages"""
