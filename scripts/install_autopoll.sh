@@ -500,8 +500,32 @@ StandardError=append:/tmp/wtt_autopoll_error.log
 WantedBy=default.target
 UNIT
 
+  # Clean stale standalone processes before restarting managed service.
+  pkill -f "$SKILL_ROOT/start_wtt_autopoll.py" >/dev/null 2>&1 || true
+  rm -f "$SKILL_ROOT/.autopoll.pid" >/dev/null 2>&1 || true
+
   systemctl --user daemon-reload
   systemctl --user enable --now wtt-autopoll.service
+  systemctl --user reset-failed wtt-autopoll.service || true
+  systemctl --user restart wtt-autopoll.service
+
+  # Keep only one process: the systemd MainPID.
+  local main_pid pids pid count
+  sleep 1
+  main_pid="$(systemctl --user show wtt-autopoll.service -p MainPID --value 2>/dev/null || echo 0)"
+  pids="$(pgrep -f "$SKILL_ROOT/start_wtt_autopoll.py" || true)"
+  for pid in $pids; do
+    if [[ -n "$main_pid" && "$main_pid" != "0" && "$pid" != "$main_pid" ]]; then
+      kill "$pid" >/dev/null 2>&1 || true
+    fi
+  done
+
+  count="$(pgrep -f "$SKILL_ROOT/start_wtt_autopoll.py" | wc -l | tr -d ' ')"
+  if [[ "$count" != "1" ]]; then
+    echo "❌ Expected exactly 1 autopoll process, found $count"
+    systemctl --user status wtt-autopoll.service --no-pager || true
+    return 1
+  fi
 
   echo "✅ Linux systemd user service installed"
   systemctl --user status wtt-autopoll.service --no-pager || true
