@@ -1163,11 +1163,15 @@ class OpenClawAgent:
         candidates.sort(key=lambda x: (x.get("updated_at") or x.get("created_at") or ""), reverse=True)
 
         # 1) explicit recent hint from task-input/task-status context
+        # Guard against stale hints on reused topics: accept hint only when it is still active.
         hinted_id = self._get_topic_task_hint(topic_id)
         if hinted_id:
             hinted = next((t for t in candidates if self._normalize_task_id(t.get("id") or "") == hinted_id), None)
             if hinted:
-                return self._task_runtime_meta(hinted)
+                hinted_status = str(hinted.get("status") or "").lower()
+                hinted_mode = str(hinted.get("task_mode") or "").lower()
+                if hinted_status in {"todo", "doing"} and ((not prefer_pipeline) or hinted_mode == "pipeline"):
+                    return self._task_runtime_meta(hinted)
 
         # 2) pipeline-biased resolve (for pipeline auto-start/rerun paths)
         if prefer_pipeline:
