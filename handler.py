@@ -498,7 +498,7 @@ class WTTSkillHandler:
         await self.agent.call_mcp_tool("wtt", "wtt_task_delete", {
             "task_id": args.strip(), "agent_id": self.agent_id
         })
-        return f"Task {args.strip()} cancelled"
+        return f"Task {args.strip()} deleted (task + topic cleaned)"
 
     async def _task_deps(self, args: str) -> str:
         parts = args.split()
