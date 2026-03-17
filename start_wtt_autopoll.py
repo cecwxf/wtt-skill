@@ -173,6 +173,7 @@ class OpenClawAgent:
         self._recent_self_published = {}
         self._task_topic_cache = {}  # topic_id -> (is_task_topic: bool, ts)
         self._recent_human_trigger = {}  # key(topic|sender|content) -> ts
+        self._topic_task_hints = {}  # topic_id -> (task_id, ts), used for no-task_id dispatch recovery
         # non-task auto-reply guard (prevent agent<->agent ping-pong)
         self._topic_auto_guard = {}  # topic_id -> {last_ts, count, locked}
         self._task_watch_last_report = {}  # task_id -> last_report_no
@@ -1082,6 +1083,133 @@ class OpenClawAgent:
         m = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F-]{10,}|[0-9a-fA-F-]{32,})", token)
         return m.group(1) if m else token
 
+    def _extract_to_task_hint(self, content: str) -> str:
+        """Extract to_task/task_id hint from system payloads like [TASK_INPUT] to_task=..."""
+        if not content:
+            return ""
+        m = re.search(r"(?:to_task|task_id)=([^\s\n]+)", content)
+        return self._normalize_task_id((m.group(1) if m else ""))
+
+    def _remember_topic_task_hint(self, topic_id: str, task_id: str):
+        tid = self._normalize_task_id(task_id)
+        if not topic_id or not tid:
+            return
+        self._topic_task_hints[str(topic_id)] = (tid, time.time())
+        if len(self._topic_task_hints) > 2000:
+            self._topic_task_hints = dict(list(self._topic_task_hints.items())[-1000:])
+
+    def _get_topic_task_hint(self, topic_id: str, ttl_sec: int = 900) -> str:
+        if not topic_id:
+            return ""
+        item = self._topic_task_hints.get(str(topic_id))
+        if not item:
+            return ""
+        task_id, ts = item
+        if (time.time() - float(ts or 0)) > ttl_sec:
+            self._topic_task_hints.pop(str(topic_id), None)
+            return ""
+        return self._normalize_task_id(task_id)
+
+    def _task_runtime_meta(self, task: dict) -> dict:
+        return {
+            "task_id": self._normalize_task_id(task.get("id") or task.get("task_id") or ""),
+            "title": str(task.get("title") or ""),
+            "description": str(task.get("description") or ""),
+            "exec_mode": str(task.get("exec_mode") or "reasoning"),
+            "task_type": str(task.get("task_type") or task.get("type") or "feature"),
+        }
+
+    async def _resolve_task_for_topic(self, topic_id: str, title_hint: str = "", description_hint: str = "", prefer_pipeline: bool = False) -> dict:
+        """Resolve task for a topic safely when incoming payload lacks task_id.
+
+        Strategy (high-confidence only):
+        1) recent topic->task hint (from to_task/task_id payloads)
+        2) unique exact/fuzzy title match
+        3) unique active task (todo/doing)
+        4) unique pipeline-ish active task (when prefer_pipeline)
+        5) single candidate only
+        Otherwise return empty task_id to avoid misrouting.
+        """
+        empty = {
+            "task_id": "",
+            "title": title_hint or "",
+            "description": description_hint or "",
+            "exec_mode": "reasoning",
+            "task_type": "feature",
+        }
+        if not topic_id:
+            return empty
+
+        try:
+            resp = await wtt_client.client.get(
+                f"{wtt_client.api_url}/tasks",
+                params={"limit": 500},
+                timeout=15,
+            )
+            if resp.status_code >= 400:
+                return empty
+            payload = resp.json() if hasattr(resp, "json") else []
+            tasks = payload if isinstance(payload, list) else payload.get("tasks", [])
+        except Exception:
+            return empty
+
+        candidates = [
+            t for t in (tasks or [])
+            if str(t.get("topic_id") or "") == str(topic_id)
+        ]
+        if not candidates:
+            return empty
+
+        # newest first for deterministic fallback behavior
+        candidates.sort(key=lambda x: (x.get("updated_at") or x.get("created_at") or ""), reverse=True)
+
+        # 1) explicit recent hint from task-input/task-status context
+        hinted_id = self._get_topic_task_hint(topic_id)
+        if hinted_id:
+            hinted = next((t for t in candidates if self._normalize_task_id(t.get("id") or "") == hinted_id), None)
+            if hinted:
+                return self._task_runtime_meta(hinted)
+
+        norm = lambda s: re.sub(r"\s+", "", str(s or "").strip().lower())
+        title_hint_norm = norm(title_hint)
+
+        # 2) title match
+        if title_hint_norm:
+            exact = [t for t in candidates if norm(t.get("title")) == title_hint_norm]
+            if len(exact) == 1:
+                return self._task_runtime_meta(exact[0])
+            fuzzy = [
+                t for t in candidates
+                if title_hint_norm in norm(t.get("title")) or norm(t.get("title")) in title_hint_norm
+            ]
+            if len(fuzzy) == 1:
+                return self._task_runtime_meta(fuzzy[0])
+
+        # 3) unique active task
+        active = [t for t in candidates if str(t.get("status") or "").lower() in {"todo", "doing"}]
+        if len(active) == 1:
+            return self._task_runtime_meta(active[0])
+
+        # 4) pipeline-biased resolve (for pipeline auto-start/rerun paths)
+        if prefer_pipeline:
+            pipeline_active = [
+                t for t in candidates
+                if str(t.get("task_mode") or "").lower() == "pipeline"
+                and str(t.get("status") or "").lower() in {"todo", "doing", "review"}
+            ]
+            if len(pipeline_active) == 1:
+                return self._task_runtime_meta(pipeline_active[0])
+
+        # 5) single candidate only
+        if len(candidates) == 1:
+            return self._task_runtime_meta(candidates[0])
+
+        print(
+            f"⚠️ Ambiguous topic->task resolve skipped topic={topic_id} "
+            f"title_hint={title_hint!r} candidates={len(candidates)}"
+        )
+        return empty
+
     def _extract_task_run(self, content: str):
         if not content:
             return None
@@ -1818,18 +1946,45 @@ class OpenClawAgent:
             sender = msg.get("sender_id", "unknown")
             sender_type = str(msg.get("sender_type") or "").lower()
 
+            # Update topic->task hint cache early (helps later no-task_id dispatch recovery).
+            msg_task_id = self._normalize_task_id(msg.get("task_id") or "")
+            if topic_id and msg_task_id:
+                self._remember_topic_task_hint(topic_id, msg_task_id)
+            hint_from_payload = self._extract_to_task_hint(content)
+            if topic_id and hint_from_payload:
+                self._remember_topic_task_hint(topic_id, hint_from_payload)
+
             # 1) 收到任务下发消息后自动执行（仅系统/agent下发，不处理 human general chat )
             tr = self._extract_task_run(content)
             semantic_type = str(msg.get("semantic_type") or "").upper()
-            is_dispatch_msg = semantic_type in {"TASK_REQUEST", "TASK_RUN"} or "[TASK_RUN]" in content or "title=" in content
+            is_dispatch_msg = semantic_type in {"TASK_REQUEST", "TASK_RUN"} or "[TASK_RUN]" in content or "title=" in content or "Task Title:" in content
             if tr and topic_id and (sender_type != "human" or is_dispatch_msg):
                 runner = tr.get("runner")
-                task_id = self._normalize_task_id(tr.get("task_id") or msg.get("task_id") or "unknown")
+                task_id = self._normalize_task_id(tr.get("task_id") or msg_task_id)
                 exec_mode = tr.get("exec_mode") or "reasoning"
                 task_type = tr.get("task_type") or "feature"
                 title = tr.get("title") or msg.get("task_title") or ""
                 description = tr.get("description") or ""
+
+                if not task_id:
+                    resolved = await self._resolve_task_for_topic(
+                        topic_id,
+                        title_hint=title,
+                        description_hint=description,
+                        prefer_pipeline=("Pipeline auto-start" in content or "Upstream completed" in content),
+                    )
+                    task_id = self._normalize_task_id(resolved.get("task_id") or "")
+                    title = resolved.get("title") or title
+                    description = resolved.get("description") or description
+                    exec_mode = resolved.get("exec_mode") or exec_mode
+                    task_type = resolved.get("task_type") or task_type
+
                 if (not runner) or (runner == self.agent_id):
+                    if not task_id:
+                        print(f"⚠️ Skip dispatch without task_id topic={topic_id} title={title!r}")
+                        self.processed_message_ids.add(msg_id)
+                        continue
+                    self._remember_topic_task_hint(topic_id, task_id)
                     asyncio.create_task(self._execute_task_run(topic_id, task_id, exec_mode, task_type, title, description))
                     print("🚀 Execution started")
                     self.processed_message_ids.add(msg_id)
@@ -2000,19 +2155,20 @@ class OpenClawAgent:
             resolved_exec_mode = "reasoning"
             resolved_task_type = "feature"
             if topic_id and (not resolved_task_id):
-                try:
-                    tr = await wtt_client.client.get(f"{wtt_client.api_url}/tasks?limit=500")
-                    if tr.status_code < 400:
-                        for t in (tr.json() or []):
-                            if t.get("topic_id") == topic_id:
-                                resolved_task_id = t.get("id") or resolved_task_id
-                                resolved_title = t.get("title") or resolved_title
-                                resolved_desc = t.get("description") or ""
-                                resolved_exec_mode = t.get("exec_mode") or "reasoning"
-                                resolved_task_type = t.get("task_type") or "feature"
-                                break
-                except Exception:
-                    pass
+                resolved = await self._resolve_task_for_topic(
+                    topic_id,
+                    title_hint=resolved_title,
+                    description_hint=resolved_desc,
+                    prefer_pipeline=False,
+                )
+                resolved_task_id = resolved.get("task_id") or resolved_task_id
+                resolved_title = resolved.get("title") or resolved_title
+                resolved_desc = resolved.get("description") or resolved_desc
+                resolved_exec_mode = resolved.get("exec_mode") or resolved_exec_mode
+                resolved_task_type = resolved.get("task_type") or resolved_task_type
+
+            if topic_id and resolved_task_id:
+                self._remember_topic_task_hint(topic_id, resolved_task_id)
 
             # Task running: queue user supplemental input and process after completion
             queue_key = f"{topic_id}:{resolved_task_id or 'unknown'}"

@@ -297,9 +297,37 @@ class WTTSkillRunner:
             task_type = str(task.get("type") or task.get("task_type") or data.get("task_type") or "feature")
             if not task_id or not topic_id:
                 return
+
+            # Canonicalize with task table to avoid WS payload/task_id mismatch misrouting.
+            if hasattr(self.agent, '_get_task'):
+                canonical = await self.agent._get_task(task_id)
+                if canonical:
+                    canonical_topic = str(canonical.get("topic_id") or topic_id)
+                    canonical_title = str(canonical.get("title") or "")
+
+                    def _norm(s: str) -> str:
+                        return re.sub(r"\s+", "", (s or "").strip().lower())
+
+                    if topic_id and canonical_topic and canonical_topic != topic_id:
+                        print(f"⚠️ [WS] Skip todo task due topic mismatch event_topic={topic_id} db_topic={canonical_topic} task={task_id[:12]}")
+                        return
+                    if title and canonical_title and _norm(title) != _norm(canonical_title):
+                        print(f"⚠️ [WS] Skip todo task due title mismatch event={title[:24]!r} db={canonical_title[:24]!r} task={task_id[:12]}")
+                        return
+
+                    topic_id = canonical_topic or topic_id
+                    title = canonical_title or title
+                    description = str(canonical.get("description") or description)
+                    exec_mode = str(canonical.get("exec_mode") or exec_mode)
+                    task_type = str(canonical.get("task_type") or canonical.get("type") or task_type)
+
             # Only handle tasks on topics we're subscribed to
             if topic_id not in self._subscribed_topics:
                 return
+
+            if hasattr(self.agent, '_remember_topic_task_hint'):
+                self.agent._remember_topic_task_hint(topic_id, task_id)
+
             print(f"📋 [WS] New todo task: {title[:30]} ({task_id[:12]})")
             if hasattr(self.agent, '_execute_task_run'):
                 import asyncio
