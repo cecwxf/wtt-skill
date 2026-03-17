@@ -86,9 +86,25 @@ class WTTSkillRunner:
         new_fmt = any("Task Title:" in ln for ln in lines) and any("Task Desc:" in ln for ln in lines)
         return old_fmt or new_fmt
 
+    _PROGRESS_PATTERNS_IM = [
+        re.compile(r'^Time:\s*\d{1,2}:\d{2}:\d{2}\s*\n\s*Progress:\s*\d+%', re.MULTILINE),
+        re.compile(r'^Status:\s*\[Task:', re.MULTILINE),
+        re.compile(r'^\[STATUS\]\s*(Started|Completed)', re.MULTILINE),
+        re.compile(r'^Plan Mode result:', re.MULTILINE),
+        re.compile(r'^Plan Mode结果', re.MULTILINE),
+        re.compile(r'^Progress:\s*\d+%\s*$', re.MULTILINE),
+        re.compile(r'^\[TASK_STATUS\]', re.MULTILINE),
+        re.compile(r'^\[TASK_RUN\]', re.MULTILINE),
+    ]
+
     def _should_suppress_im(self, message: dict) -> bool:
-        # Keep task dispatch/progress/result visible in IM; no source suppression
-        return False
+        """Suppress progress/status messages from IM unless env override."""
+        if os.getenv("WTT_IM_SHOW_PROGRESS", "0").lower() in ("1", "true", "yes"):
+            return False
+        content = (message.get("content") or "").strip()
+        if not content:
+            return False
+        return any(p.search(content) for p in self._PROGRESS_PATTERNS_IM)
 
     def _humanize_notification(self, message: dict) -> str:
         content = (message.get("content") or "").strip()
@@ -415,7 +431,7 @@ class WTTSkillRunner:
                 # Only notify via polling when WS is disconnected to avoid duplicates
                 if not self._ws_connected:
                     for m in messages:
-                        if self._should_notify(m):
+                        if self._should_notify(m) and not self._should_suppress_im(m):
                             notification = self._humanize_notification(m)
                             if notification:
                                 print(f"\n📬 {notification}\n")

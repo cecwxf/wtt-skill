@@ -163,7 +163,8 @@ class OpenClawAgent:
         self._task_semaphore = asyncio.Semaphore(self.max_concurrent_tasks)
         self._task_queue: list[str] = []  # task keys waiting for a slot
         self.reject_rerun_cooldown_sec = int(os.getenv("WTT_REJECT_RERUN_COOLDOWN", "120"))
-        # Hard rule: report progress at least every 60 seconds while running
+        # Progress publishing: default OFF — only final result published to topic/IM
+        self.publish_progress = os.getenv("WTT_PUBLISH_PROGRESS", "0").lower() in ("1", "true", "yes")
         self.task_progress_interval_sec = 60
         self.task_max_runtime_sec = int(os.getenv("WTT_TASK_MAX_RUNTIME", "600"))
         self.task_stale_timeout_sec = int(os.getenv("WTT_TASK_STALE_TIMEOUT", "900"))
@@ -496,18 +497,19 @@ class OpenClawAgent:
                     if result and result.upper() != "READY":
                         if topic_id:
                             ts = time.strftime('%H:%M:%S')
-                            try:
-                                await asyncio.wait_for(
-                                    self._safe_publish(
-                                        topic_id,
-                                        f"Time: {ts}\n"
-                                        f"Progress: 100%\n"
-                                        f"Status: [Task: {title or 'general chat'}] reasoning completed"
-                                    ),
-                                    timeout=15,
-                                )
-                            except asyncio.TimeoutError:
-                                pass
+                            if self.publish_progress:
+                                try:
+                                    await asyncio.wait_for(
+                                        self._safe_publish(
+                                            topic_id,
+                                            f"Time: {ts}\n"
+                                            f"Progress: 100%\n"
+                                            f"Status: [Task: {title or 'general chat'}] reasoning completed"
+                                        ),
+                                        timeout=15,
+                                    )
+                                except asyncio.TimeoutError:
+                                    pass
                         return result
                     raise RuntimeError("session infer timeout: no assistant text returned")
             except Exception as e:
@@ -1514,7 +1516,8 @@ class OpenClawAgent:
         return obj
 
     async def _publish_task_status(self, topic_id: str, task_id: str, executor_label: str, session_id: str, phase: str, progress: int, action: str, elapsed_sec: int = 0):
-        # 只发布简洁状态，不暴露内部ID
+        if not self.publish_progress:
+            return
         if progress == 0:
             await self._safe_publish(topic_id, "[STATUS] Started...")
         elif progress == 100:
@@ -1560,13 +1563,10 @@ class OpenClawAgent:
         payload = (content or "").strip()
         if not payload:
             return True
-        if not payload.startswith("┌─ 来源标识"):
-            payload = (
-                "┌─ Source ─────────────\n"
-                f"│ Agent: {self.agent_id}\n"
-                "└────────────────────\n"
-                f"{payload}"
-            )
+        # Strip [Model: ... | Effort: ...] tags injected by inference gateway
+        payload = re.sub(r'\s*\[Model:\s*[^\]]*\]', '', payload).strip()
+        if not payload:
+            return True
 
         # Prefer WebSocket publish when connected
         if self._ws_runner and self._ws_runner.is_ws_connected:
@@ -1656,12 +1656,15 @@ class OpenClawAgent:
                     minute = max(1, elapsed // 60)
                     progress_pct = min(95, max(20, minute * 20))
                     ts = time.strftime('%H:%M:%S')
-                    await self._safe_publish(
-                        topic_id,
-                        f"Time: {ts}\n"
-                        f"Progress: {progress_pct}%\n"
-                        f"Status: [Task: {title}] reasoning running(running {minute} min )"
-                    )
+                    if self.publish_progress:
+                        await self._safe_publish(
+                            topic_id,
+                            f"Time: {ts}\n"
+                            f"Progress: {progress_pct}%\n"
+                            f"Status: [Task: {title}] reasoning running(running {minute} min )"
+                        )
+                    else:
+                        print(f"📊 [watchdog] task={task_id[:12]} {progress_pct}% running {minute}min", flush=True)
 
                     # Stale detection: force-reset tasks stuck too long
                     first_seen = float(self._task_watch_first_seen.get(task_id, now_mono))
@@ -1670,11 +1673,12 @@ class OpenClawAgent:
                         print(f"💀 Task {task_id[:12]} ({title}) stuck for {int(age)}s > {self.task_stale_timeout_sec}s, force reset")
                         try:
                             await self._set_task_status(task_id, "todo")
-                            await self._safe_publish(
-                                topic_id,
-                                f"Time: {ts}\nProgress: 0%\n"
-                                f"Status: [Task: {title}] Timed out after {minute} min, will retry"
-                            )
+                            if self.publish_progress:
+                                await self._safe_publish(
+                                    topic_id,
+                                    f"Time: {ts}\nProgress: 0%\n"
+                                    f"Status: [Task: {title}] Timed out after {minute} min, will retry"
+                                )
                             key_to_remove = None
                             for k in list(self.active_task_runs):
                                 if task_id in k:
@@ -1713,12 +1717,13 @@ class OpenClawAgent:
             queue_pos = len(self._task_queue) + 1
             self._task_queue.append(key)
             print(f"⏳ Task {task_id} queued (position {queue_pos}, max concurrent={self.max_concurrent_tasks})")
-            await self._safe_publish(
-                topic_id,
-                f"Time: {time.strftime('%H:%M:%S')}\n"
-                f"Progress: 0%\n"
-                f"Status: [Task: {title or 'untitled task'}] Queued (position {queue_pos})"
-            )
+            if self.publish_progress:
+                await self._safe_publish(
+                    topic_id,
+                    f"Time: {time.strftime('%H:%M:%S')}\n"
+                    f"Progress: 0%\n"
+                    f"Status: [Task: {title or 'untitled task'}] Queued (position {queue_pos})"
+                )
 
         try:
             async with self._task_semaphore:
@@ -1758,9 +1763,11 @@ class OpenClawAgent:
                             plan_detail_lines.append(f"   {i}.{j} {str((st or {}).get('title') or f'子任务{i}.{j}').strip()}")
 
                     plan_lines = [f"Plan Mode result: total {len(phases)} phases"] + (plan_detail_lines or ["(no phase details extracted)"])
-                    await self._safe_publish(topic_id, "\n".join(plan_lines))
+                    if self.publish_progress:
+                        await self._safe_publish(topic_id, "\n".join(plan_lines))
                 except Exception as e:
-                    await self._safe_publish(topic_id, f"Plan Mode结果：失败\n原因: {e}")
+                    if self.publish_progress:
+                        await self._safe_publish(topic_id, f"Plan Mode结果：失败\n原因: {e}")
 
             started_at = int(time.time())
             runtime_action = "Agent is reasoning..."
@@ -1768,12 +1775,13 @@ class OpenClawAgent:
                 runtime_action = "Processing follow-up input and updating conclusion"
 
             ts0 = time.strftime('%H:%M:%S')
-            await self._safe_publish(
-                topic_id,
-                f"Time: {ts0}\n"
-                f"Progress: 0%\n"
-                f"Status: [Task: {title or 'untitled task'}] {runtime_action}"
-            )
+            if self.publish_progress:
+                await self._safe_publish(
+                    topic_id,
+                    f"Time: {ts0}\n"
+                    f"Progress: 0%\n"
+                    f"Status: [Task: {title or 'untitled task'}] {runtime_action}"
+                )
 
             result_text = "Task execution finished and result returned."
             artifact_raw = ""
@@ -1816,15 +1824,18 @@ class OpenClawAgent:
                             phase_action = f"Executing phase: {phase_titles[idx]}"
                         # Guard: don't let a slow publish block the ticker
                         try:
-                            await asyncio.wait_for(
-                                self._safe_publish(
-                                    topic_id,
-                                    f"Time: {ts}\n"
-                                    f"Progress: {progress_pct}%\n"
-                                    f"Status: [Task: {title or 'untitled task'}] {phase_action}(running {minute} min )"
-                                ),
-                                timeout=15,
-                            )
+                            if self.publish_progress:
+                                await asyncio.wait_for(
+                                    self._safe_publish(
+                                        topic_id,
+                                        f"Time: {ts}\n"
+                                        f"Progress: {progress_pct}%\n"
+                                        f"Status: [Task: {title or 'untitled task'}] {phase_action}(running {minute} min )"
+                                    ),
+                                    timeout=15,
+                                )
+                            else:
+                                print(f"📊 [progress] task={task_id[:12]} {progress_pct}% {phase_action}", flush=True)
                         except asyncio.TimeoutError:
                             print(f"⚠️ progress ticker publish timeout (task={task_id})")
 
@@ -1848,12 +1859,13 @@ class OpenClawAgent:
             done_action = f"{title or 'untitled task'} task completed"
             if phase_titles:
                 done_action = f"All phases completed (total {len(phase_titles)} phases )"
-            await self._safe_publish(
-                topic_id,
-                f"Time: {ts_done}\n"
-                f"Progress: 100%\n"
-                f"Status: [Task: {title or 'untitled task'}] {done_action}"
-            )
+            if self.publish_progress:
+                await self._safe_publish(
+                    topic_id,
+                    f"Time: {ts_done}\n"
+                    f"Progress: 100%\n"
+                    f"Status: [Task: {title or 'untitled task'}] {done_action}"
+                )
 
             publish_text = (artifact_raw or "").strip() or (result_text or "").strip()
             if publish_text:
