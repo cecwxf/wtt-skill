@@ -1122,12 +1122,11 @@ class OpenClawAgent:
     async def _resolve_task_for_topic(self, topic_id: str, title_hint: str = "", description_hint: str = "", prefer_pipeline: bool = False) -> dict:
         """Resolve task for a topic safely when incoming payload lacks task_id.
 
-        Strategy (high-confidence only):
-        1) recent topic->task hint (from to_task/task_id payloads)
-        2) unique exact/fuzzy title match
+        Strategy (ID-first, no title routing):
+        1) recent topic->task hint (from msg.task_id / to_task / task_id payloads)
+        2) unique active pipeline task (when prefer_pipeline)
         3) unique active task (todo/doing)
-        4) unique pipeline-ish active task (when prefer_pipeline)
-        5) single candidate only
+        4) single candidate only
         Otherwise return empty task_id to avoid misrouting.
         """
         empty = {
@@ -1170,35 +1169,20 @@ class OpenClawAgent:
             if hinted:
                 return self._task_runtime_meta(hinted)
 
-        norm = lambda s: re.sub(r"\s+", "", str(s or "").strip().lower())
-        title_hint_norm = norm(title_hint)
-
-        # 2) title match
-        if title_hint_norm:
-            exact = [t for t in candidates if norm(t.get("title")) == title_hint_norm]
-            if len(exact) == 1:
-                return self._task_runtime_meta(exact[0])
-            fuzzy = [
+        # 2) pipeline-biased resolve (for pipeline auto-start/rerun paths)
+        if prefer_pipeline:
+            pipeline_active = [
                 t for t in candidates
-                if title_hint_norm in norm(t.get("title")) or norm(t.get("title")) in title_hint_norm
+                if str(t.get("task_mode") or "").lower() == "pipeline"
+                and str(t.get("status") or "").lower() in {"todo", "doing"}
             ]
-            if len(fuzzy) == 1:
-                return self._task_runtime_meta(fuzzy[0])
+            if len(pipeline_active) == 1:
+                return self._task_runtime_meta(pipeline_active[0])
 
         # 3) unique active task
         active = [t for t in candidates if str(t.get("status") or "").lower() in {"todo", "doing"}]
         if len(active) == 1:
             return self._task_runtime_meta(active[0])
-
-        # 4) pipeline-biased resolve (for pipeline auto-start/rerun paths)
-        if prefer_pipeline:
-            pipeline_active = [
-                t for t in candidates
-                if str(t.get("task_mode") or "").lower() == "pipeline"
-                and str(t.get("status") or "").lower() in {"todo", "doing", "review"}
-            ]
-            if len(pipeline_active) == 1:
-                return self._task_runtime_meta(pipeline_active[0])
 
         # 5) single candidate only
         if len(candidates) == 1:
